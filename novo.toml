@@ -1,6 +1,6 @@
 [package]
 name        = "btree-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "An ordered map over fixed-size pages, sans-IO: node layout, lookup, range scan, insert and delete run as pure state machines that ask for pages and hand pages back, and the host performs every read and every write."
 license     = "Apache-2.0"
 
@@ -21,6 +21,7 @@ tags        = ["btree", "b+tree", "ordered-map", "pages", "sans-io", "sqlite", "
 repository  = "https://github.com/novolang/btree-nv"
 bugs        = "https://github.com/novolang/btree-nv/issues"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
