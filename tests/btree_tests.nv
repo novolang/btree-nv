@@ -1,0 +1,187 @@
+// btree_tests.nv — the page-request protocol, driven by hand.
+//
+// EVERY TEST HERE FAILS TODAY: btree-nv is published as its interface
+// and every body is `todo()`.  The file is written the way a HOST
+// writes against this package — a loop that steps a cursor, answers
+// whatever it asks for, and steps again — because that loop is the
+// interface, and an interface nobody has written a caller for has not
+// been reviewed.
+
+use std.test
+use std.list
+use std.str
+use cell
+use nodefmt
+use btree
+
+// One stored page: the smallest thing that can answer a `PrNeedPage`.
+struct Slot
+    id: Int
+    bytes: [Int]
+
+fn slot_bytes(slots: [Slot], id: Int) -> ?[Int]
+    match list.find(slots, s => s.id == id)
+        Some(s) => Some(s.bytes)
+        None    => None
+
+// What one drive of a cursor did, so a test can assert on the shape of
+// the traffic rather than only on the answer.
+struct Drive
+    affected: Int
+    writes: Int
+    allocs: Int
+    frees: Int
+    stalled: Bool
+
+// KeyedRow a cursor to `SDone`, answering reads from `slots` and counting
+// everything else.  `guard` is what stops a walk that asks for a page
+// nobody has: the loop gives up and says so rather than spinning.
+fn drive(start: btree.Cursor, slots: [Slot]) -> Drive
+    var c = start
+    var affected = 0 - 1
+    var writes = 0
+    var allocs = 0
+    var frees = 0
+    var stalled = false
+    var going = true
+    var guard = 0
+    while going and guard < 64
+        guard += 1
+        let p = btree.step(c)
+        c = p.cursor
+        match p.step
+            SDone(n)    =>
+                affected = n
+            SFailed(e)  =>
+                going = false
+            SRow(k, r)  =>
+                going = true
+            SRequest(q) =>
+                match q
+                    PrNeedPage(id)    =>
+                        match slot_bytes(slots, id)
+                            Some(b) =>
+                                c = btree.feed_page(c, id, b)
+                            None    =>
+                                stalled = true
+                    PrWritePage(i, b) =>
+                        writes += 1
+                    PrAllocPage(k)    =>
+                        allocs += 1
+                    PrFreePage(i)     =>
+                        frees += 1
+        if affected >= 0 or stalled
+            going = false
+    Drive { affected: affected, writes: writes, allocs: allocs, frees: frees, stalled: stalled }
+
+@test
+fn test_open_names_the_root_page() [io]
+    let t = btree.open(1, 0, 1)
+    test.assert_eq(t.root, 1)
+    test.assert_eq(t.size, 0)
+    test.assert_eq(t.height, 1)
+
+@test
+fn test_create_asks_for_a_leaf_page_first() [io]
+    // A tree with no root is not a `Tree`, so `create` hands back the
+    // request instead of a tree: the host allocates, then `open`s.
+    match btree.create()
+        PrAllocPage(k)    => test.assert_eq(k, nodefmt.KIND_LEAF)
+        PrNeedPage(p)     => test.fail("a new tree has no page to read")
+        PrWritePage(p, b) => test.fail("a new tree has nothing to write yet")
+        PrFreePage(p)     => test.fail("a new tree has nothing to free")
+
+@test
+fn test_a_lookup_asks_for_the_root_before_anything_else() [io]
+    // The first step of every walk is the same: the descent cannot
+    // decide which page it wants second until it has the first.
+    let c = btree.lookup(btree.open(4, 1, 1), 42)
+    match btree.step(c).step
+        SRequest(q) =>
+            match q
+                PrNeedPage(id)    => test.assert_eq(id, 4)
+                PrWritePage(i, b) => test.fail("a lookup writes nothing")
+                PrAllocPage(k)    => test.fail("a lookup allocates nothing")
+                PrFreePage(i)     => test.fail("a lookup frees nothing")
+        SRow(k, r)  => test.fail("no page has been read yet")
+        SDone(n)    => test.fail("no page has been read yet")
+        SFailed(e)  => test.fail(e.message())
+
+@test
+fn test_awaiting_names_the_page_the_cursor_is_blocked_on() [io]
+    // A host driving several cursors batches its reads off this; one
+    // driving them singly never calls it.  Both are supported, which is
+    // the reason the protocol is data rather than a callback.
+    let p = btree.step(btree.scan(btree.open(9, 0, 1)))
+    test.assert_eq(btree.awaiting(p.cursor), Some(9))
+
+@test
+fn test_a_cursor_not_waiting_awaits_nothing() [io]
+    test.assert_none(btree.awaiting(btree.lookup(btree.open(1, 0, 1), 1)))
+
+@test
+fn test_feeding_a_page_the_cursor_did_not_ask_for_is_an_error() [io]
+    // The host and the tree agree on exactly one outstanding request.
+    // A host that answers the wrong one has a bug the tree can see, and
+    // reading the wrong page as the right one is how a walk silently
+    // returns another table's rows.
+    let p = btree.step(btree.scan(btree.open(9, 0, 1)))
+    let bad = btree.feed_page(p.cursor, 11, [])
+    match btree.step(bad).step
+        SFailed(e)  => test.assert_true(str.len(e.message()) > 0, "it names both ids")
+        SRow(k, r)  => test.fail("a mis-fed page must not produce a row")
+        SDone(n)    => test.fail("a mis-fed page must not finish the walk")
+        SRequest(q) => test.fail("a mis-fed page must not be ignored")
+
+@test
+fn test_range_carries_both_bounds_inclusive() [io]
+    let c = btree.range(btree.open(1, 100, 2), 10, 20)
+    test.assert_eq(btree.tree_of(c).root, 1)
+    // The bounds are inclusive at both ends, which is novodb's
+    // `btree_range` and what a `BETWEEN` lowers to without a fixup.
+    test.assert_eq(c.low, 10)
+    test.assert_eq(c.high, 20)
+
+@test
+fn test_insert_carries_the_row_and_nothing_else_does() [io]
+    let row = [cell.of_int(1), cell.of_str("a")]
+    let ins = btree.insert(btree.open(1, 0, 1), 5, row)
+    test.assert_eq(list.len(ins.payload), 2)
+    test.assert_eq(list.len(btree.delete(btree.open(1, 0, 1), 5).payload), 0)
+    test.assert_eq(list.len(btree.scan(btree.open(1, 0, 1)).payload), 0)
+
+@test
+fn test_delete_of_an_absent_key_finishes_at_zero_and_does_not_fail() [io]
+    // A DELETE that matched nothing is a statement that affected no
+    // rows, not an error — the SQL engine reports `SDone(0)` upward.
+    let root = nodefmt.encode_header(nodefmt.KIND_LEAF, 1)
+    let d = drive(btree.delete(btree.open(1, 0, 1), 404), [Slot { id: 1, bytes: root }])
+    test.assert_false(d.stalled, "the walk asked only for pages the fixture has")
+    test.assert_eq(d.affected, 0)
+
+@test
+fn test_a_delete_that_changes_nothing_writes_nothing() [io]
+    // A write the tree did not need is a page the pager has to journal
+    // and fsync, so "did it write" is behaviour and not an internal.
+    let root = nodefmt.encode_header(nodefmt.KIND_LEAF, 1)
+    let d = drive(btree.delete(btree.open(1, 0, 1), 404), [Slot { id: 1, bytes: root }])
+    test.assert_eq(d.writes, 0)
+    test.assert_eq(d.allocs, 0)
+    test.assert_eq(d.frees, 0)
+
+@test
+fn test_tree_of_is_where_a_split_reports_the_new_root() [io]
+    // An insert that splits the root moves it, and the id the caller
+    // must persist is the one on the FINISHED cursor.  A host that
+    // re-opens on the old root after a split reads a tree missing a
+    // level, so this accessor is not a convenience.
+    let c = btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)])
+    test.assert_eq(btree.tree_of(c).root, 1)
+
+@test
+fn test_feed_alloc_answers_the_allocation_the_write_path_asked_for() [io]
+    // novodb has no counterpart to this: its paged tree is read-only
+    // and its writes go through a whole-file rewrite.  The pairing is
+    // designed here, so it is tested here.
+    let c = btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)])
+    test.assert_eq(btree.tree_of(btree.feed_alloc(c, 12)).root, 1)

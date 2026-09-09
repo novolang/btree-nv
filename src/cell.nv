@@ -1,0 +1,179 @@
+// cell.nv — the value a row holds, and the bytes it becomes.
+//
+// A row is a `[Cell]`, and a cell is one of five things SQLite's
+// storage classes name: an integer, a float, text, a blob, or NULL.
+// Nothing else appears in a page, so nothing else appears here.
+//
+// WHY THIS TYPE LIVES IN btree-nv AND NOT IN sql-engine-nv
+//
+// novodb carries two of it.  `parse.Value` is what a literal in the
+// SQL text becomes (`VInt`, `VFloat`, `VStr`, `VNull`, `VBlob`) and
+// `btree.Cell` is what a row in the tree holds (`CInt`, `CFloat`,
+// `CStr`, `CNull`, `CBlob`) — the same five classes, twice, with
+// `parse.value_to_cell` copying between them at every INSERT.  The
+// duplication is free inside one package and is not free across two:
+// it would put the bridge function on the package boundary, where a
+// consumer would have to know both spellings and which side of the
+// call it was on.  So there is one type, it is the STORAGE one, and
+// sql-engine-nv's literals produce it directly.
+//
+// The encoding below is `page_btree.nv`'s, unchanged: a one-byte tag
+// then the payload, big-endian throughout.  The float case is the one
+// that is not settled — novodb encodes a float as the TEXT of
+// `string_of_float` because the stdlib had no `float.to_bits` when it
+// was written, which is neither compact nor round-trip exact.  This
+// package declares the bit form and the README says so.
+
+// A stored value: one of the five classes a page can hold.
+//
+// Byte tags, as they appear in an encoded row — the numbers are the
+// format, not an implementation detail, so they are written here
+// rather than derived:
+//
+// | tag | variant  | payload |
+// | --- | --- | --- |
+// | 0 | `CNull` | none |
+// | 1 | `CInt` | 8 bytes, big-endian two's complement |
+// | 2 | `CFloat` | 8 bytes, IEEE-754 binary64, big-endian |
+// | 3 | `CStr` | 4-byte big-endian length, then that many UTF-8 bytes |
+// | 4 | `CBlob` | 4-byte big-endian length, then that many raw bytes |
+pub enum Cell
+    CNull
+    CInt(n: Int)
+    CFloat(f: Float)
+    CStr(s: Str)
+    CBlob(bytes: [Int])
+
+// A cell holding an integer.
+//
+// ```novo
+// use cell
+//
+// let c = cell.of_int(42)
+// ```
+pub fn of_int(n: Int) -> Cell
+    todo("btree-nv.cell.of_int")
+
+// A cell holding a float.
+pub fn of_float(f: Float) -> Cell
+    todo("btree-nv.cell.of_float")
+
+// A cell holding text.
+pub fn of_str(s: Str) -> Cell
+    todo("btree-nv.cell.of_str")
+
+// A cell holding a blob, one byte (0..=255) per element.
+pub fn of_blob(bytes: [Int]) -> Cell
+    todo("btree-nv.cell.of_blob")
+
+// The NULL cell.
+pub fn null_cell() -> Cell
+    todo("btree-nv.cell.null_cell")
+
+// The integer a cell holds, or `None` when it holds something else.
+//
+// The accessors exist so a consumer never matches `Cell` itself.
+// That is novodb's own rule — `btree.nv` owns the representation and
+// `parse` and `exec` reach it only through these — and it is what
+// makes adding a sixth storage class one arm here rather than an arm
+// in every `match` in the closure.
+pub fn as_int(c: Cell) -> ?Int
+    todo("btree-nv.cell.as_int")
+
+// The float a cell holds, or `None` when it holds something else.
+pub fn as_float(c: Cell) -> ?Float
+    todo("btree-nv.cell.as_float")
+
+// The text a cell holds, or `None` when it holds something else.
+pub fn as_str(c: Cell) -> ?Str
+    todo("btree-nv.cell.as_str")
+
+// The blob bytes a cell holds, or `None` when it holds something else.
+pub fn as_blob(c: Cell) -> ?[Int]
+    todo("btree-nv.cell.as_blob")
+
+// True when the cell is NULL.
+pub fn is_null(c: Cell) -> Bool
+    todo("btree-nv.cell.is_null")
+
+// The cell's byte tag — the number in the table on `Cell`.
+//
+// This is also the storage-class order SQL comparison uses when it has
+// to order values of different classes, which is why it is public
+// rather than private to the encoder.
+pub fn tag(c: Cell) -> Int
+    todo("btree-nv.cell.tag")
+
+// How many bytes `encode_cell` will write for this cell.
+//
+// Computed without encoding, because the leaf encoder has to decide
+// whether a row still fits the page before it commits to writing it.
+pub fn encoded_size(c: Cell) -> Int
+    todo("btree-nv.cell.encoded_size")
+
+// How many bytes `encode_row` will write for this row.
+pub fn encoded_row_size(row: [Cell]) -> Int
+    todo("btree-nv.cell.encoded_row_size")
+
+// Append one cell's bytes to `out`, returning the extended list.
+pub fn encode_cell(out: [Int], c: Cell) -> [Int]
+    todo("btree-nv.cell.encode_cell")
+
+// Append a whole row: a 4-byte big-endian cell count, then each cell.
+pub fn encode_row(out: [Int], row: [Cell]) -> [Int]
+    todo("btree-nv.cell.encode_row")
+
+// One decoded cell and the offset just past it.
+pub struct CellAt
+    value: Cell
+    next_offset: Int
+
+// One decoded row and the offset just past it.
+pub struct RowAt
+    row: [Cell]
+    next_offset: Int
+
+// Decode the cell that starts at `offset`, or say how the bytes were
+// wrong.
+pub fn decode_cell(buf: [Int], offset: Int) -> Result<CellAt, CellError>
+    todo("btree-nv.cell.decode_cell")
+
+// Decode the row that starts at `offset`, or say how the bytes were
+// wrong.
+pub fn decode_row(buf: [Int], offset: Int) -> Result<RowAt, CellError>
+    todo("btree-nv.cell.decode_row")
+
+// Why a run of bytes is not a cell or a row.
+//
+// Every arm names the offset it failed at, because a caller holding a
+// 4096-byte page and a "bad tag" has been told nothing.
+pub enum CellError
+    // The tag byte at this offset is not one of 0..=4.
+    BadTag(offset: Int, tag: Int)
+    // A length prefix ran past the end of the buffer.
+    Truncated(offset: Int, want: Int, have: Int)
+    // A text payload is not valid UTF-8.
+    BadUtf8(offset: Int)
+    // A blob byte is outside 0..=255, which the encoder cannot have
+    // written — the page has been corrupted since it was stored.
+    ByteOutOfRange(offset: Int, value: Int)
+
+// The human sentence behind each way a cell can fail to decode.
+//
+// `Result<T, E>` carries an `Error` bound (SPEC § 3.4), so this impl
+// is what lets the decoders return the enum rather than a string.
+impl Error for CellError
+    fn message(self) -> Str
+        todo("btree-nv.cell.CellError.message")
+
+// The cell as SQL text: an integer bare, text single-quoted, a blob as
+// `X'aabb'`, and NULL as `NULL`.
+//
+// The rendering is the one novodb's `show_cell` produces, which the
+// SQL-logic-test corpus compares against.
+pub fn show(c: Cell) -> Str
+    todo("btree-nv.cell.show")
+
+// A row as SQL text: `show` of each cell, separated by `, `.
+pub fn show_row(row: [Cell]) -> Str
+    todo("btree-nv.cell.show_row")

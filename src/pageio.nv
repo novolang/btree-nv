@@ -1,0 +1,114 @@
+// pageio.nv — the same walk, written as a loop instead of a protocol.
+//
+// `btree.step` hands the host a `PageRequest` and waits.  That is the
+// shape that has no effects at all, and it is the shape a host with an
+// event loop, a batching reader or an async pager wants.  A host with
+// a plain file wants a function call.  This module is that: a trait
+// with one effect parameter, and drivers that bind it.
+//
+//     trait PageIo[e]                  the host's four operations
+//     pub fn run<S: PageIo[e]>(…) [e]  charged what the impl costs
+//
+// SPEC § 5.6 is what makes this legal in a `core` package.  A free
+// function cannot be `[e]`, but a function that BINDS the effect
+// parameter of one of its own trait bounds can, and the row means
+// "whatever the impl behind `S` supplies".  `pager-nv` supplies
+// `[fs]`, so a program that calls `run` with a pager is charged
+// `[fs]`; a test that supplies an in-memory page table implements
+// `PageIo[]` and is charged nothing.  Neither charge lands on this
+// package, whose budget stays `[]`.
+//
+// WHICH SHAPE TO USE
+//
+// `btree.step` is the primitive and this is built on it — a host that
+// needs to interleave, batch or suspend must use `step`, because a
+// call into `run` does not come back until the walk is over.  Use
+// `run` when the pager is synchronous, which is what pager-nv is.
+
+use cell
+use btree
+
+// The four things a host can do with a page, and what each costs.
+//
+// The trait binds one effect parameter, `e`, and every member uses it
+// (SPEC § 5.6 requires both).  An impl supplies the set its own
+// implementation actually costs: `impl PageIo[fs] for Pager` in
+// pager-nv, `impl PageIo[] for PageTable` in a test.
+pub trait PageIo[e]
+    // The whole page stored under this id, header included.
+    fn fetch(self, page_id: Int) -> Result<[Int], IoFault> [e]
+    // Store these bytes under this id.
+    fn store(self, page_id: Int, bytes: [Int]) -> Result<Unit, IoFault> [e]
+    // Allocate a page of this kind and answer with its id.
+    fn allocate(self, kind: Int) -> Result<Int, IoFault> [e]
+    // Release a page that is no longer reachable.
+    fn release(self, page_id: Int) -> Result<Unit, IoFault> [e]
+
+// Everything a finished walk produced.
+//
+// `rows` is empty for an insert or a delete, and `tree` is the tree to
+// keep — an insert that split the root moved it.
+pub struct Outcome
+    rows: [[cell.Cell]]
+    keys: [Int]
+    rows_affected: Int
+    tree: btree.Tree
+
+// Run a cursor to completion, answering every request it makes.
+//
+// The row is `[e]`: this call costs exactly what `S`'s own `PageIo`
+// impl costs, and that impl is declared where the host is.  A `core`
+// package can therefore take a host's page store without leaving its
+// own budget, which is the whole reason SPEC § 5.6 gives functions the
+// binding.
+//
+// ```novo
+// use btree
+// use pageio
+//
+// fn all_rows<S: pageio.PageIo[e]>(io: S, t: btree.Tree) -> Int [e]
+//     match pageio.run(io, btree.scan(t))
+//         Ok(out) => out.rows_affected
+//         Err(f)  => 0
+//
+// fn main() [io]
+//     println("a core walk, charged what the host's impl costs")
+// ```
+pub fn run<S: PageIo[e]>(io: S, start: btree.Cursor) -> Result<Outcome, IoFault> [e]
+    todo("btree-nv.pageio.run")
+
+// Run a cursor until its next row, so a caller can stop early.
+//
+// Answers `None` when the walk finished without another row.  A
+// `LIMIT` that stops after ten rows of a million-row table is the
+// reason this exists beside `run`.
+pub fn next_row<S: PageIo[e]>(io: S, c: btree.Cursor) -> Result<?NextRow, IoFault> [e]
+    todo("btree-nv.pageio.next_row")
+
+// One row, its key, and the cursor to continue from.
+pub struct NextRow
+    key: Int
+    row: [cell.Cell]
+    cursor: btree.Cursor
+
+// Why the host could not answer a request.
+//
+// A `BtreeError` is the tree saying the bytes were wrong; an
+// `IoFault` is the host saying it could not get them.  They are two
+// types because the two have different readers: one is a bug in
+// whatever wrote the file, the other is a disk.
+pub enum IoFault
+    // The host could not read this page.
+    ReadFailed(page_id: Int, why: Str)
+    // The host could not store this page.
+    WriteFailed(page_id: Int, why: Str)
+    // The host had no page to give — the store is full, or read-only.
+    AllocFailed(why: Str)
+    // The tree stopped on its own; the host performed everything asked
+    // of it.
+    Walk(cause: btree.BtreeError)
+
+// The human sentence behind each way a host can fail a request.
+impl Error for IoFault
+    fn message(self) -> Str
+        todo("btree-nv.pageio.IoFault.message")

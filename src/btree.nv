@@ -1,0 +1,264 @@
+// btree.nv — the tree as a state machine that asks for pages.
+//
+// THE LOAD-BEARING INTERFACE IS `PageRequest`
+//
+// A B+-tree lookup is a descent, and a descent needs the page under
+// the cursor before it can decide which page to want next.  That read
+// is the only thing in a tree that touches the machine, so it is the
+// only thing this package refuses to do.  Every operation is a
+// `Cursor` the caller advances:
+//
+//     step(cursor) -> Progress { cursor, step }
+//
+// and `step` is one of four things.  `SRow` and `SDone` are answers.
+// `SFailed` is a page that did not decode.  `SRequest` is the tree
+// saying what it needs, and the caller performs it and hands the
+// result back through `feed_page` / `feed_alloc` before stepping
+// again.  Nothing in this module is charged an effect, and nothing in
+// it can be: it is `core`, its budget is `[]` (SPEC § "Package
+// layers"), and the compiler refuses a body that exceeds it.
+//
+// The loop a host writes is five lines, and `pageio.run` is that loop
+// written once for a host that would rather implement a trait — see
+// that module for the effect-polymorphic form, which costs the caller
+// exactly what its own `PageIo` impl costs and nothing more.
+//
+// WHERE THIS CAME FROM, AND WHERE IT DIVERGES
+//
+// novodb's `page_btree.nv` is the same tree over the same page format,
+// and its walkers are `lazy_btree_get`, `lazy_btree_size`,
+// `lazy_btree_scan_all` — each declared `[fs]`, each taking a
+// `PageSource` that resolves a page id by reading the file.  That is
+// the design this package inverts: the walk is the same, and the read
+// leaves with it.  Two consequences worth naming before anybody
+// implements a body:
+//
+//   * novodb's paged tree is READ-ONLY.  Writes go through a full
+//     rewrite in `pagefile.page_log_save`.  `PrWritePage`,
+//     `PrAllocPage` and `PrFreePage` below have no counterpart to port
+//     from; they are designed here.
+//   * novodb's in-memory tree is the one that inserts, and it
+//     path-copies rather than mutating, which is what gives its
+//     transaction layer snapshot isolation for free.  The paged
+//     insert has to buy that back with the pager's copy-on-write, and
+//     `PrAllocPage` is where it is bought.
+
+use cell
+use nodefmt
+
+// What the tree needs the host to do before it can continue.
+//
+// This enum is the package's boundary, and `sql-engine-nv` and
+// `pager-nv` both name it rather than declaring one each — see the
+// README's "The load-bearing interface".  It lives HERE, in the lower
+// of the two `core` packages, because the tree is the thing that runs
+// out of pages: the SQL engine only relays what its cursors ask for,
+// and a type flowing downward through a relay belongs at the bottom.
+pub enum PageRequest
+    // Read this page and give it back with `feed_page`.
+    PrNeedPage(page_id: Int)
+    // Store these `nodefmt.page_size()` bytes under this id.  The host
+    // may buffer them; the tree does not step again on the answer.
+    PrWritePage(page_id: Int, bytes: [Int])
+    // Allocate a fresh page of this kind and give its id back with
+    // `feed_alloc`.  The write path needs this and novodb has no
+    // counterpart to it — its paged form is read-only.
+    PrAllocPage(kind: Int)
+    // This page is no longer reachable.  Whether that means reuse now
+    // or reuse at the next commit is the pager's decision, not the
+    // tree's; novodb defers it under a snapshot pin and this package
+    // says nothing about which.
+    PrFreePage(page_id: Int)
+
+// A tree, named by the page its root lives on.
+//
+// `size` and `height` are the values the last completed operation
+// left; on a tree that was opened and not yet walked they are what
+// `open` was told.
+pub struct Tree
+    root: Int
+    size: Int
+    height: Int
+
+// What a cursor is doing, which is what decides how it answers a page.
+pub enum Op
+    // Find one key.
+    OpLookup
+    // Every row, in key order.
+    OpScanAll
+    // Every row whose key is in `[low, high]`, in key order.
+    OpRange
+    // Put a row at a key, replacing any row already there.
+    OpInsert
+    // Remove the row at a key.
+    OpDelete
+
+// One advance of a cursor.
+pub enum KeyedRow
+    // A row, and the key it was stored under.  Only `OpLookup`,
+    // `OpScanAll` and `OpRange` produce these.
+    SRow(key: Int, row: [cell.Cell])
+    // The operation finished.  `rows_affected` is 1 for an insert, 1
+    // for a delete that found its key, 0 for a delete that did not,
+    // and the row count for a scan.
+    SDone(rows_affected: Int)
+    // The tree needs something done before it can continue.
+    SRequest(req: PageRequest)
+    // A page did not decode, or the tree's shape contradicted itself.
+    SFailed(err: BtreeError)
+
+// A cursor and the step it just took.
+//
+// The cursor comes back rather than being mutated because nothing in
+// this package mutates: SPEC § 14's `@value` shape is what lets a
+// caller hold two cursors over one tree and know they cannot alias.
+pub struct Progress
+    cursor: Cursor
+    step: KeyedRow
+
+// A position in a walk, and everything the walk still needs to know.
+//
+// The fields are the state machine's own and are NOT a stable surface
+// below 1.0 — a consumer reads `Progress.step` and calls the functions
+// below.  They are declared rather than hidden because a reviewer of
+// an interface is reviewing exactly this: the claim that a descent
+// needs a path, a slot per level, and one page in hand, and nothing
+// else that a host would have to keep for it.
+pub struct Cursor
+    // The tree being walked.
+    tree: Tree
+    // What this cursor is doing.
+    op: Op
+    // The key bounds.  `OpLookup`, `OpInsert` and `OpDelete` set both
+    // to the one key; `OpScanAll` sets the full range.
+    low: Int
+    high: Int
+    // The row an insert is carrying, empty for every other op.
+    payload: [cell.Cell]
+    // Page ids from the root down to the page under the cursor.
+    path: [Int]
+    // The entry index reached within each page on `path`.
+    slots: [Int]
+    // The page id the cursor last asked for and has not been fed, or 0
+    // when it is not waiting on one.
+    awaiting_page: Int
+    // Rows emitted or rows changed so far.
+    affected: Int
+    // Set once the walk has failed; every later `step` repeats it.
+    failed: ?BtreeError
+
+// A tree rooted at this page.
+//
+// `size` and `height` are what the caller already knows — a pager
+// reads them from the file header — and nothing verifies them; they
+// are what `Tree` answers until a walk corrects it.
+pub fn open(root_page_id: Int, size: Int, height: Int) -> Tree
+    todo("btree-nv.btree.open")
+
+// The request that starts an empty tree: one page to be its root.
+//
+// A tree with no root is not a `Tree`, so this returns the request
+// rather than a tree — the caller performs it and passes the id it
+// gets back to `open`.
+pub fn create() -> PageRequest
+    todo("btree-nv.btree.create")
+
+// A cursor that will produce the row at `key`, or `SDone(0)`.
+pub fn lookup(t: Tree, key: Int) -> Cursor
+    todo("btree-nv.btree.lookup")
+
+// A cursor that will produce every row in key order.
+pub fn scan(t: Tree) -> Cursor
+    todo("btree-nv.btree.scan")
+
+// A cursor that will produce every row whose key is in `[low, high]`,
+// in key order, both bounds inclusive.
+pub fn range(t: Tree, low: Int, high: Int) -> Cursor
+    todo("btree-nv.btree.range")
+
+// A cursor that will store `row` under `key`, replacing whatever was
+// there.
+//
+// The walk emits `PrWritePage` for the leaf, and — when the leaf split
+// — a `PrAllocPage` and a `PrWritePage` for each new node up to and
+// including a new root.  `tree_of` on the finished cursor is the tree
+// to keep: a split changes the root.
+pub fn insert(t: Tree, key: Int, row: [cell.Cell]) -> Cursor
+    todo("btree-nv.btree.insert")
+
+// A cursor that will remove the row at `key`.
+//
+// Finishes `SDone(0)` when the key was not there, which is not an
+// error.
+pub fn delete(t: Tree, key: Int) -> Cursor
+    todo("btree-nv.btree.delete")
+
+// Advance the cursor once.
+//
+// ```novo
+// use btree
+//
+// fn count_rows(start: btree.Cursor) -> Int
+//     var c = start
+//     var n = 0
+//     var going = true
+//     while going
+//         let p = btree.step(c)
+//         c = p.cursor
+//         match p.step
+//             SRow(k, r)  => n = n + 1
+//             SDone(a)    => going = false
+//             SFailed(e)  => going = false
+//             SRequest(q) => going = false
+//     n
+// ```
+pub fn step(c: Cursor) -> Progress
+    todo("btree-nv.btree.step")
+
+// Hand back the page the cursor asked for.
+//
+// `bytes` is a whole page, `nodefmt.page_size()` long, header
+// included; the header's id is checked against the id that was asked
+// for, and a disagreement finishes the cursor with `IdMismatch`.
+pub fn feed_page(c: Cursor, page_id: Int, bytes: [Int]) -> Cursor
+    todo("btree-nv.btree.feed_page")
+
+// Hand back the id of a page the cursor asked to have allocated.
+pub fn feed_alloc(c: Cursor, page_id: Int) -> Cursor
+    todo("btree-nv.btree.feed_alloc")
+
+// The page id the cursor is waiting for, or `None` when it is not
+// waiting.
+//
+// A host that drives several cursors at once uses this to batch reads;
+// one that drives them one at a time never needs it.
+pub fn awaiting(c: Cursor) -> ?Int
+    todo("btree-nv.btree.awaiting")
+
+// The tree as the cursor now understands it.
+//
+// After an insert that split the root this is the tree to keep: the
+// root moved, and the caller has to store the new id somewhere the
+// next `open` will read it.
+pub fn tree_of(c: Cursor) -> Tree
+    todo("btree-nv.btree.tree_of")
+
+// Why a walk stopped.
+pub enum BtreeError
+    // A page did not decode as the node the descent expected.
+    BadNode(page_id: Int, cause: nodefmt.NodeError)
+    // The host fed a page the cursor had not asked for.
+    Unexpected(fed: Int, wanted: Int)
+    // The descent went deeper than a tree of this size can be, which
+    // means the child pointers form a cycle.
+    Cycle(page_id: Int, depth: Int)
+    // A row did not fit a page even alone on it.  The overflow-page
+    // chain that would fix this is not in this version.
+    RowTooLarge(key: Int, need: Int, have: Int)
+    // A cursor was stepped after it had finished.
+    Finished
+
+// The human sentence behind each way a walk can stop.
+impl Error for BtreeError
+    fn message(self) -> Str
+        todo("btree-nv.btree.BtreeError.message")

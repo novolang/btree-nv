@@ -1,0 +1,117 @@
+// nodefmt_tests.nv — the page layout, asserted as a layout.
+//
+// EVERY TEST HERE FAILS TODAY: btree-nv is published as its interface
+// and every body is `todo()`.  What is written below is what the
+// bodies will be measured against, and the byte offsets in it are the
+// FORMAT — a page written by one version and read by another is the
+// whole reason this package exists as a package, so the offsets are
+// asserted directly rather than round-tripped through the encoder.
+
+use std.test
+use std.list
+use cell
+use nodefmt
+
+@test
+fn test_page_geometry_is_the_documented_geometry() [io]
+    // 4096 is the page size of every filesystem this runs on and of
+    // SQLite's own default; the 16-byte header is novodb's.
+    test.assert_eq(nodefmt.page_size(), 4096)
+    test.assert_eq(nodefmt.header_size(), 16)
+    test.assert_eq(nodefmt.payload_size(), 4080)
+    test.assert_eq(nodefmt.page_size(), nodefmt.header_size() + nodefmt.payload_size())
+
+@test
+fn test_fanout_is_the_measured_sixteen() [io]
+    // Measured, not guessed: over M in {4, 8, 16, 32} on novodb's
+    // 1000-row benchmark every read path roughly halved from 4 to 16
+    // while insert stayed inside noise, and 32 started costing inserts.
+    test.assert_eq(nodefmt.fanout(), 16)
+    // The B+-tree invariant: a node that reached fanout+1 keys splits
+    // into split_at and (fanout+1)-split_at.
+    test.assert_eq(nodefmt.split_at(), nodefmt.fanout() / 2)
+
+@test
+fn test_header_carries_kind_and_id_where_the_layout_says() [io]
+    let h = nodefmt.encode_header(nodefmt.KIND_LEAF, 7)
+    test.assert_eq(list.len(h), nodefmt.header_size())
+    // byte 0 is the kind; bytes 4..7 are the id, big-endian.
+    test.assert_eq(h[0], nodefmt.KIND_LEAF)
+    test.assert_eq(h[4], 0)
+    test.assert_eq(h[5], 0)
+    test.assert_eq(h[6], 0)
+    test.assert_eq(h[7], 7)
+    test.assert_eq(nodefmt.kind_of(h), Some(nodefmt.KIND_LEAF))
+    test.assert_eq(nodefmt.id_of(h), Some(7))
+
+@test
+fn test_kinds_do_not_collide_with_the_pager_s_own_pages() [io]
+    // 1..5 are the pager's (root, internal, leaf, freelist, overflow);
+    // a tree node takes 6 and 7 so one tag space serves both packages.
+    test.assert_eq(nodefmt.KIND_LEAF, 6)
+    test.assert_eq(nodefmt.KIND_INNER, 7)
+
+@test
+fn test_a_short_page_has_no_kind_and_no_id() [io]
+    test.assert_none(nodefmt.kind_of([]))
+    test.assert_none(nodefmt.id_of([1, 2, 3]))
+
+@test
+fn test_leaf_round_trips_through_a_whole_page() [io]
+    let node = Leaf { keys: [1, 4, 9],
+                              rows: [[cell.of_int(1)], [cell.of_str("four")], [cell.null_cell()]] }
+    match nodefmt.encode_leaf(3, node)
+        Err(e)   => test.fail(e.message())
+        Ok(page) =>
+            test.assert_eq(list.len(page), nodefmt.page_size())
+            match nodefmt.decode_leaf(page)
+                Err(e)   => test.fail(e.message())
+                Ok(back) => test.assert_eq(back.keys, node.keys)
+
+@test
+fn test_inner_holds_one_more_child_than_separator() [io]
+    // That shape IS the B+-tree: a key descends into `children[i]`
+    // where `i` counts the separators at or below it.
+    let node = Inner { separators: [10, 20], children: [11, 12, 13] }
+    test.assert_eq(list.len(node.children), list.len(node.separators) + 1)
+    match nodefmt.encode_inner(2, node)
+        Err(e)   => test.fail(e.message())
+        Ok(page) =>
+            match nodefmt.decode_inner(page)
+                Err(e)   => test.fail(e.message())
+                Ok(back) => test.assert_eq(back.children, node.children)
+
+@test
+fn test_decoding_the_wrong_kind_is_an_error_and_not_a_guess() [io]
+    let node = Inner { separators: [], children: [5] }
+    match nodefmt.encode_inner(1, node)
+        Err(e)   => test.fail(e.message())
+        Ok(page) =>
+            match nodefmt.decode_leaf(page)
+                Ok(leaf) => test.fail("an inner page is not a leaf")
+                Err(e)   => test.assert_true(str.len(e.message()) > 0, "it says which kind it found")
+
+@test
+fn test_encoded_size_decides_the_split_before_the_bytes_are_spent() [io]
+    // The insert path asks these before it commits to a leaf.  If they
+    // disagree with the encoder the tree overflows a page it had
+    // already judged to fit, so the pair is one decision.
+    let node = Leaf { keys: [1], rows: [[cell.of_int(1)]] }
+    test.assert_true(nodefmt.leaf_encoded_size(node) <= nodefmt.payload_size(),
+                     "one small row fits one page")
+    let inner = Inner { separators: [1], children: [2, 3] }
+    test.assert_true(nodefmt.inner_encoded_size(inner) <= nodefmt.payload_size(),
+                     "two children fit one page")
+
+@test
+fn test_seek_and_child_for_agree_on_the_descent() [io]
+    // `seek` answers where a key is or would go; `child_for` is that
+    // answer read as a child index.  Writing them twice is how a tree
+    // gets a lookup that disagrees with its own insert.
+    test.assert_eq(nodefmt.seek([10, 20, 30], 20), 1)
+    test.assert_eq(nodefmt.seek([10, 20, 30], 25), 2)
+    test.assert_eq(nodefmt.seek([], 1), 0)
+    let node = Inner { separators: [10, 20], children: [1, 2, 3] }
+    test.assert_eq(nodefmt.child_for(node, 5), 0)
+    test.assert_eq(nodefmt.child_for(node, 15), 1)
+    test.assert_eq(nodefmt.child_for(node, 25), 2)

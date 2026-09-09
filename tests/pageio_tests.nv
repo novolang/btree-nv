@@ -1,0 +1,110 @@
+// pageio_tests.nv — the effect-polymorphic driver, supplied with a
+// page store that costs nothing.
+//
+// EVERY TEST HERE FAILS TODAY: btree-nv is published as its interface
+// and `pageio.run` is a `todo()`.  What is not a todo, and what this
+// file exists to prove, is the EFFECT ARITHMETIC — that the shape
+// SPEC § 5.6 describes actually holds for this trait:
+//
+//   * `PageTable` supplies `[]`, so `impl PageIo[] for PageTable`
+//     costs nothing;
+//   * `pageio.run` binds `e` on its own bound, so calling it with a
+//     `PageTable` charges the caller `[]`;
+//   * the test functions below therefore declare only `[io]`, which is
+//     the assertion printer's, and not `[fs]`.
+//
+// A caller with a `pager-nv` supplying `[fs]` is charged `[fs]` at the
+// same call, from the same source line in `pageio`.  That is the whole
+// claim, and this file is where it is checked rather than asserted.
+
+use std.test
+use std.list
+use cell
+use btree
+use pageio
+
+// A page store with no machine behind it — a list of ids and a list of
+// pages, walked linearly.  A test double, and also the shape an
+// embedded consumer uses for a tree in flash.
+struct Held
+    id: Int
+    bytes: [Int]
+
+struct PageTable
+    slots: [Held]
+
+// Supplying `[]` is how an impl asserts it is pure (SPEC § 5.6).  It
+// is what makes the tests below cost nothing but their own printing.
+impl PageIo[] for PageTable
+    fn fetch(self, page_id: Int) -> Result<[Int], IoFault>
+        match list.find(self.slots, s => s.id == page_id)
+            Some(s) => Ok(s.bytes)
+            None    => Err(ReadFailed(page_id, "no such page"))
+
+    fn store(self, page_id: Int, bytes: [Int]) -> Result<Unit, IoFault>
+        // A value-shaped double stores nothing; the walk under test is
+        // a read, and a write here would have nowhere to go.
+        Err(WriteFailed(page_id, "this page table is read-only"))
+
+    fn allocate(self, kind: Int) -> Result<Int, IoFault>
+        Err(AllocFailed("this page table is fixed"))
+
+    fn release(self, page_id: Int) -> Result<Unit, IoFault>
+        Ok()
+
+fn empty_table() -> PageTable
+    PageTable { slots: [] }
+
+@test
+fn test_a_pure_impl_costs_a_pure_caller_nothing() [io]
+    // THIS FUNCTION'S EFFECT ROW IS THE ASSERTION.  `run` is declared
+    // `[e]`; `PageTable` supplies `[]`; so this call is charged `[]`
+    // and `[io]` below is only the printer's.  Were the substitution
+    // wrong, this file would not compile — which is the point of
+    // writing the test at all.
+    match pageio.run(empty_table(), btree.scan(btree.open(1, 0, 1)))
+        Ok(out) => test.assert_eq(out.rows_affected, 0)
+        Err(f)  => test.assert_true(str.len(f.message()) > 0, "the fault says what failed")
+
+@test
+fn test_a_read_that_cannot_be_answered_is_an_IoFault_not_a_BtreeError() [io]
+    // The two error types are the two readers: a `BtreeError` is the
+    // tree saying the bytes were wrong — somebody's writer is broken —
+    // and an `IoFault` is the host saying it could not get them.
+    // Collapsing them would put a disk failure and a corrupt page in
+    // one arm, and they are not one problem.
+    match pageio.run(empty_table(), btree.lookup(btree.open(7, 1, 1), 1))
+        Ok(out) => test.fail("page 7 is not in an empty table")
+        Err(f)  =>
+            match f
+                ReadFailed(id, why) => test.assert_eq(id, 7)
+                WriteFailed(i, w)   => test.fail("a lookup writes nothing")
+                AllocFailed(w)      => test.fail("a lookup allocates nothing")
+                Walk(cause)         => test.fail("the host failed first, not the tree")
+
+@test
+fn test_next_row_lets_a_limit_stop_early() [io]
+    // `run` does not come back until the walk is over, so a `LIMIT 10`
+    // over a million rows needs the other shape.  Answering `None`
+    // rather than an empty `Outcome` is what lets the caller tell
+    // "finished" from "one more row".
+    match pageio.next_row(empty_table(), btree.scan(btree.open(1, 0, 1)))
+        Ok(hit) => test.assert_none(hit)
+        Err(f)  => test.assert_true(str.len(f.message()) > 0, "the fault says what failed")
+
+@test
+fn test_outcome_carries_the_tree_to_keep() [io]
+    // After an insert that split the root, the root moved; the id in
+    // `Outcome.tree` is the one the caller has to persist.
+    match pageio.run(empty_table(), btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)]))
+        Ok(out) => test.assert_eq(out.tree.root, 1)
+        Err(f)  => test.assert_true(str.len(f.message()) > 0, "the fault says what failed")
+
+@test
+fn test_rows_and_keys_run_parallel() [io]
+    // `Outcome` keeps them apart rather than pairing them, because a
+    // caller projecting columns wants the rows alone and a caller
+    // resuming wants the last key alone.
+    match pageio.run(empty_table(), btree.range(btree.open(1, 0, 1), 0, 10))
+        Ok(out) => test.assert_eq(list.len(out.rows), list.len(out.keys))
+        Err(f)  => test.assert_true(str.len(f.message()) > 0, "the fault says what failed")
