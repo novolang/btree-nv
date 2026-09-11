@@ -9,7 +9,7 @@
 
 use std.test
 use std.list
-use cell
+use btcell
 use nodefmt
 
 @test
@@ -59,7 +59,7 @@ fn test_a_short_page_has_no_kind_and_no_id() [io]
 @test
 fn test_leaf_round_trips_through_a_whole_page() [io]
     let node = Leaf { keys: [1, 4, 9],
-                              rows: [[cell.of_int(1)], [cell.of_str("four")], [cell.null_cell()]] }
+                              rows: [[btcell.of_int(1)], [btcell.of_str("four")], [btcell.null_cell()]] }
     match nodefmt.encode_leaf(3, node)
         Err(e)   => test.fail(e.message())
         Ok(page) =>
@@ -96,7 +96,7 @@ fn test_encoded_size_decides_the_split_before_the_bytes_are_spent() [io]
     // The insert path asks these before it commits to a leaf.  If they
     // disagree with the encoder the tree overflows a page it had
     // already judged to fit, so the pair is one decision.
-    let node = Leaf { keys: [1], rows: [[cell.of_int(1)]] }
+    let node = Leaf { keys: [1], rows: [[btcell.of_int(1)]] }
     test.assert_true(nodefmt.leaf_encoded_size(node) <= nodefmt.payload_size(),
                      "one small row fits one page")
     let inner = Inner { separators: [1], children: [2, 3] }

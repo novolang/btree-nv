@@ -25,7 +25,7 @@
 // call into `run` does not come back until the walk is over.  Use
 // `run` when the pager is synchronous, which is what pager-nv is.
 
-use cell
+use btcell
 use btree
 
 // The four things a host can do with a page, and what each costs.
@@ -49,7 +49,7 @@ pub trait PageIo[e]
 // `rows` is empty for an insert or a delete, and `tree` is the tree to
 // keep — an insert that split the root moved it.
 pub struct Outcome
-    rows: [[cell.Cell]]
+    rows: [[btcell.Cell]]
     keys: [Int]
     rows_affected: Int
     tree: btree.Tree
@@ -88,7 +88,7 @@ pub fn next_row<S: PageIo[e]>(io: S, c: btree.Cursor) -> Result<?NextRow, IoFaul
 // One row, its key, and the cursor to continue from.
 pub struct NextRow
     key: Int
-    row: [cell.Cell]
+    row: [btcell.Cell]
     cursor: btree.Cursor
 
 // Why the host could not answer a request.

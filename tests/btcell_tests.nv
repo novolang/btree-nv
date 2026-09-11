@@ -1,10 +1,10 @@
-// cell_tests.nv — the value type and its encoding, against the
+// btcell_tests.nv — the value type and its encoding, against the
 // signatures.
 //
 // EVERY TEST IN THIS FILE FAILS TODAY, AND THAT IS THE STATE THE
 // PACKAGE IS IN.  btree-nv is published as its interface: every body
 // is `todo()`, so every call below panics with `not implemented:
-// btree-nv.cell.…`.  What the file proves is the half an interface
+// btree-nv.btcell.…`.  What the file proves is the half an interface
 // can prove — that the signatures compose, that a caller can write
 // this code against them, and that the shapes line up where two
 // functions meet.  When the bodies land these become the first real
@@ -13,38 +13,38 @@
 use std.test
 use std.list
 use std.str
-use cell
+use btcell
 
 @test
 fn test_constructors_and_accessors_round_trip() [io]
     // Each accessor answers for its own class and `None` for the rest.
     // That is the rule that lets a consumer avoid ever matching `Cell`.
-    test.assert_eq(cell.as_int(cell.of_int(42)), Some(42))
-    test.assert_eq(cell.as_str(cell.of_str("hi")), Some("hi"))
-    test.assert_none(cell.as_int(cell.of_str("hi")))
-    test.assert_none(cell.as_str(cell.of_int(1)))
+    test.assert_eq(btcell.as_int(btcell.of_int(42)), Some(42))
+    test.assert_eq(btcell.as_str(btcell.of_str("hi")), Some("hi"))
+    test.assert_none(btcell.as_int(btcell.of_str("hi")))
+    test.assert_none(btcell.as_str(btcell.of_int(1)))
 
 @test
 fn test_float_and_blob_round_trip() [io]
-    test.assert_eq(cell.as_float(cell.of_float(1.5)), Some(1.5))
-    test.assert_eq(cell.as_blob(cell.of_blob([1, 2, 255])), Some([1, 2, 255]))
-    test.assert_none(cell.as_float(cell.of_blob([0])))
+    test.assert_eq(btcell.as_float(btcell.of_float(1.5)), Some(1.5))
+    test.assert_eq(btcell.as_blob(btcell.of_blob([1, 2, 255])), Some([1, 2, 255]))
+    test.assert_none(btcell.as_float(btcell.of_blob([0])))
 
 @test
 fn test_null_is_the_only_null() [io]
-    test.assert_true(cell.is_null(cell.null_cell()), "the null cell is null")
-    test.assert_false(cell.is_null(cell.of_int(0)), "zero is not null")
-    test.assert_false(cell.is_null(cell.of_str("")), "the empty string is not null")
+    test.assert_true(btcell.is_null(btcell.null_cell()), "the null cell is null")
+    test.assert_false(btcell.is_null(btcell.of_int(0)), "zero is not null")
+    test.assert_false(btcell.is_null(btcell.of_str("")), "the empty string is not null")
 
 @test
 fn test_tag_is_the_documented_byte() [io]
     // The tag table on `Cell` is the FORMAT, so it is asserted rather
     // than derived: a change here is a change to what is on disk.
-    test.assert_eq(cell.tag(cell.null_cell()), 0)
-    test.assert_eq(cell.tag(cell.of_int(1)), 1)
-    test.assert_eq(cell.tag(cell.of_float(1.0)), 2)
-    test.assert_eq(cell.tag(cell.of_str("a")), 3)
-    test.assert_eq(cell.tag(cell.of_blob([0])), 4)
+    test.assert_eq(btcell.tag(btcell.null_cell()), 0)
+    test.assert_eq(btcell.tag(btcell.of_int(1)), 1)
+    test.assert_eq(btcell.tag(btcell.of_float(1.0)), 2)
+    test.assert_eq(btcell.tag(btcell.of_str("a")), 3)
+    test.assert_eq(btcell.tag(btcell.of_blob([0])), 4)
 
 @test
 fn test_encoded_size_agrees_with_the_encoder() [io]
@@ -52,23 +52,23 @@ fn test_encoded_size_agrees_with_the_encoder() [io]
     // spends the bytes, so the two disagreeing is a page that overflows
     // after it was judged to fit.  Asserting the pair is what keeps
     // them one decision.
-    let c = cell.of_str("hello")
-    test.assert_eq(list.len(cell.encode_cell([], c)), cell.encoded_size(c))
-    let row = [cell.of_int(1), cell.null_cell(), cell.of_str("x")]
-    test.assert_eq(list.len(cell.encode_row([], row)), cell.encoded_row_size(row))
+    let c = btcell.of_str("hello")
+    test.assert_eq(list.len(btcell.encode_cell([], c)), btcell.encoded_size(c))
+    let row = [btcell.of_int(1), btcell.null_cell(), btcell.of_str("x")]
+    test.assert_eq(list.len(btcell.encode_row([], row)), btcell.encoded_row_size(row))
 
 @test
 fn test_encode_then_decode_is_the_identity() [io]
-    let row = [cell.of_int(0 - 1), cell.of_float(2.5), cell.of_str("e"), cell.of_blob([0, 255])]
-    match cell.decode_row(cell.encode_row([], row), 0)
-        Ok(at) => test.assert_eq_str(cell.show_row(at.row), cell.show_row(row))
+    let row = [btcell.of_int(0 - 1), btcell.of_float(2.5), btcell.of_str("e"), btcell.of_blob([0, 255])]
+    match btcell.decode_row(btcell.encode_row([], row), 0)
+        Ok(at) => test.assert_eq_str(btcell.show_row(at.row), btcell.show_row(row))
         Err(e) => test.fail(e.message())
 
 @test
 fn test_decode_cell_reports_the_offset_it_failed_at() [io]
     // A caller holding a 4096-byte page and the words "bad tag" has
     // been told nothing, so every arm of `CellError` names an offset.
-    match cell.decode_cell([9], 0)
+    match btcell.decode_cell([9], 0)
         Ok(at) => test.fail("tag 9 is not a storage class")
         Err(e) => test.assert_true(str.len(e.message()) > 0, "the error says what went wrong")
 
@@ -76,7 +76,7 @@ fn test_decode_cell_reports_the_offset_it_failed_at() [io]
 fn test_decode_row_refuses_a_truncated_payload() [io]
     // A length prefix that runs past the buffer is the corruption a
     // short read produces, and it must not be read as a short string.
-    match cell.decode_row([0, 0, 0, 1, 3, 0, 0, 0, 99], 0)
+    match btcell.decode_row([0, 0, 0, 1, 3, 0, 0, 0, 99], 0)
         Ok(at) => test.fail("a 99-byte string cannot live in 4 bytes")
         Err(e) => test.assert_true(str.len(e.message()) > 0, "the error says what went wrong")
 
@@ -84,8 +84,8 @@ fn test_decode_row_refuses_a_truncated_payload() [io]
 fn test_show_renders_sql_text() [io]
     // This rendering is what the SQL-logic-test corpus compares
     // against, so it is a format and not a debug aid.
-    test.assert_eq_str(cell.show(cell.of_int(7)), "7")
-    test.assert_eq_str(cell.show(cell.null_cell()), "NULL")
-    test.assert_eq_str(cell.show(cell.of_str("a")), "'a'")
-    test.assert_eq_str(cell.show(cell.of_blob([171, 205])), "X'abcd'")
-    test.assert_eq_str(cell.show_row([cell.of_int(1), cell.null_cell()]), "1, NULL")
+    test.assert_eq_str(btcell.show(btcell.of_int(7)), "7")
+    test.assert_eq_str(btcell.show(btcell.null_cell()), "NULL")
+    test.assert_eq_str(btcell.show(btcell.of_str("a")), "'a'")
+    test.assert_eq_str(btcell.show(btcell.of_blob([171, 205])), "X'abcd'")
+    test.assert_eq_str(btcell.show_row([btcell.of_int(1), btcell.null_cell()]), "1, NULL")

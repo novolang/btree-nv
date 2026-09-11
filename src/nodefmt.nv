@@ -22,7 +22,7 @@
 //   then M entries, each:
 //     bytes 0..7   key, big-endian i64
 //     bytes 8..11  encoded row length L, big-endian u32
-//     bytes 12..   L bytes, as `cell.encode_row` wrote them
+//     bytes 12..   L bytes, as `btcell.encode_row` wrote them
 //   zero padding to the end of the payload
 //
 // INNER PAYLOAD
@@ -41,7 +41,7 @@
 // already holds and returns bytes the caller will store.  A node is
 // fetched by `btree.step` asking for it — see `btree.PageRequest`.
 
-use cell
+use btcell
 
 // The page kind in byte 0 of a leaf page.
 //
@@ -93,7 +93,7 @@ pub fn split_at() -> Int
 // key of `rows[i]`.
 pub struct Leaf
     keys: [Int]
-    rows: [[cell.Cell]]
+    rows: [[btcell.Cell]]
 
 // An inner node, decoded: child page ids, and the separators between
 // them.
@@ -182,7 +182,7 @@ pub enum NodeError
     // rather than splitting, because the split is the tree's decision.
     Overflow(need: Int, have: Int)
     // A row inside the payload did not decode.
-    BadRow(index: Int, cause: cell.CellError)
+    BadRow(index: Int, cause: btcell.CellError)
     // The header's page id is not the id the page was fetched under —
     // the cheapest detector for a mis-seeked read.
     IdMismatch(got: Int, want: Int)

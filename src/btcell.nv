@@ -1,4 +1,4 @@
-// cell.nv — the value a row holds, and the bytes it becomes.
+// btcell.nv — the value a row holds, and the bytes it becomes.
 //
 // A row is a `[Cell]`, and a cell is one of five things SQLite's
 // storage classes name: an integer, a float, text, a blob, or NULL.
@@ -47,28 +47,28 @@ pub enum Cell
 // A cell holding an integer.
 //
 // ```novo
-// use cell
+// use btcell
 //
-// let c = cell.of_int(42)
+// let c = btcell.of_int(42)
 // ```
 pub fn of_int(n: Int) -> Cell
-    todo("btree-nv.cell.of_int")
+    todo("btree-nv.btcell.of_int")
 
 // A cell holding a float.
 pub fn of_float(f: Float) -> Cell
-    todo("btree-nv.cell.of_float")
+    todo("btree-nv.btcell.of_float")
 
 // A cell holding text.
 pub fn of_str(s: Str) -> Cell
-    todo("btree-nv.cell.of_str")
+    todo("btree-nv.btcell.of_str")
 
 // A cell holding a blob, one byte (0..=255) per element.
 pub fn of_blob(bytes: [Int]) -> Cell
-    todo("btree-nv.cell.of_blob")
+    todo("btree-nv.btcell.of_blob")
 
 // The NULL cell.
 pub fn null_cell() -> Cell
-    todo("btree-nv.cell.null_cell")
+    todo("btree-nv.btcell.null_cell")
 
 // The integer a cell holds, or `None` when it holds something else.
 //
@@ -78,23 +78,23 @@ pub fn null_cell() -> Cell
 // makes adding a sixth storage class one arm here rather than an arm
 // in every `match` in the closure.
 pub fn as_int(c: Cell) -> ?Int
-    todo("btree-nv.cell.as_int")
+    todo("btree-nv.btcell.as_int")
 
 // The float a cell holds, or `None` when it holds something else.
 pub fn as_float(c: Cell) -> ?Float
-    todo("btree-nv.cell.as_float")
+    todo("btree-nv.btcell.as_float")
 
 // The text a cell holds, or `None` when it holds something else.
 pub fn as_str(c: Cell) -> ?Str
-    todo("btree-nv.cell.as_str")
+    todo("btree-nv.btcell.as_str")
 
 // The blob bytes a cell holds, or `None` when it holds something else.
 pub fn as_blob(c: Cell) -> ?[Int]
-    todo("btree-nv.cell.as_blob")
+    todo("btree-nv.btcell.as_blob")
 
 // True when the cell is NULL.
 pub fn is_null(c: Cell) -> Bool
-    todo("btree-nv.cell.is_null")
+    todo("btree-nv.btcell.is_null")
 
 // The cell's byte tag — the number in the table on `Cell`.
 //
@@ -102,26 +102,26 @@ pub fn is_null(c: Cell) -> Bool
 // to order values of different classes, which is why it is public
 // rather than private to the encoder.
 pub fn tag(c: Cell) -> Int
-    todo("btree-nv.cell.tag")
+    todo("btree-nv.btcell.tag")
 
 // How many bytes `encode_cell` will write for this cell.
 //
 // Computed without encoding, because the leaf encoder has to decide
 // whether a row still fits the page before it commits to writing it.
 pub fn encoded_size(c: Cell) -> Int
-    todo("btree-nv.cell.encoded_size")
+    todo("btree-nv.btcell.encoded_size")
 
 // How many bytes `encode_row` will write for this row.
 pub fn encoded_row_size(row: [Cell]) -> Int
-    todo("btree-nv.cell.encoded_row_size")
+    todo("btree-nv.btcell.encoded_row_size")
 
 // Append one cell's bytes to `out`, returning the extended list.
 pub fn encode_cell(out: [Int], c: Cell) -> [Int]
-    todo("btree-nv.cell.encode_cell")
+    todo("btree-nv.btcell.encode_cell")
 
 // Append a whole row: a 4-byte big-endian cell count, then each cell.
 pub fn encode_row(out: [Int], row: [Cell]) -> [Int]
-    todo("btree-nv.cell.encode_row")
+    todo("btree-nv.btcell.encode_row")
 
 // One decoded cell and the offset just past it.
 pub struct CellAt
@@ -136,12 +136,12 @@ pub struct RowAt
 // Decode the cell that starts at `offset`, or say how the bytes were
 // wrong.
 pub fn decode_cell(buf: [Int], offset: Int) -> Result<CellAt, CellError>
-    todo("btree-nv.cell.decode_cell")
+    todo("btree-nv.btcell.decode_cell")
 
 // Decode the row that starts at `offset`, or say how the bytes were
 // wrong.
 pub fn decode_row(buf: [Int], offset: Int) -> Result<RowAt, CellError>
-    todo("btree-nv.cell.decode_row")
+    todo("btree-nv.btcell.decode_row")
 
 // Why a run of bytes is not a cell or a row.
 //
@@ -164,7 +164,7 @@ pub enum CellError
 // is what lets the decoders return the enum rather than a string.
 impl Error for CellError
     fn message(self) -> Str
-        todo("btree-nv.cell.CellError.message")
+        todo("btree-nv.btcell.CellError.message")
 
 // The cell as SQL text: an integer bare, text single-quoted, a blob as
 // `X'aabb'`, and NULL as `NULL`.
@@ -172,8 +172,8 @@ impl Error for CellError
 // The rendering is the one novodb's `show_cell` produces, which the
 // SQL-logic-test corpus compares against.
 pub fn show(c: Cell) -> Str
-    todo("btree-nv.cell.show")
+    todo("btree-nv.btcell.show")
 
 // A row as SQL text: `show` of each cell, separated by `, `.
 pub fn show_row(row: [Cell]) -> Str
-    todo("btree-nv.cell.show_row")
+    todo("btree-nv.btcell.show_row")

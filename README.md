@@ -26,13 +26,13 @@ whoever answers `PrNeedPage`, and never in the tree.
 ```novo
 use std.list
 use btree
-use cell
+use btcell
 
 // Read every row of a tree, answering each page request from a store
 // the caller already has.  `fetch` is the host's; nothing else here is.
-fn dump(t: btree.Tree) -> [[cell.Cell]] [fs]
+fn dump(t: btree.Tree) -> [[btcell.Cell]] [fs]
     var c = btree.scan(t)
-    var rows: [[cell.Cell]] = []
+    var rows: [[btcell.Cell]] = []
     var going = true
     while going
         let p = btree.step(c)
@@ -55,6 +55,11 @@ fn dump(t: btree.Tree) -> [[cell.Cell]] [fs]
 
 The `[fs]` on that function is the caller's, from its own `fetch`.
 Nothing in btree-nv contributed to it.
+
+The value module is `btcell` and not `cell` because `cell` is a standard
+library module name, and a package may not ship one — the build refuses
+the file before it reads it.  Only the module name is affected: the type
+is `Cell`, and every function keeps the name it had.
 
 ## The layer, and why
 
@@ -146,9 +151,9 @@ Each test calls a function whose body is `todo()`, so the first
 assertion in each file panics with `not implemented: btree-nv.…`:
 
 ```
-$ novo test tests/cell_tests.nv
+$ novo test tests/btcell_tests.nv
   ✗ test_constructors_and_accessors_round_trip
-      not implemented: btree-nv.cell.of_int
+      not implemented: btree-nv.btcell.of_int
   0 passed, 1 failed
 ```
 
@@ -159,11 +164,11 @@ bodies land they become the first real assertions, unchanged.
 
 | function | implemented |
 | --- | --- |
-| `cell.of_int`, `of_float`, `of_str`, `of_blob`, `null_cell` | no |
-| `cell.as_int`, `as_float`, `as_str`, `as_blob`, `is_null`, `tag` | no |
-| `cell.encoded_size`, `encoded_row_size` | no |
-| `cell.encode_cell`, `encode_row`, `decode_cell`, `decode_row` | no |
-| `cell.show`, `show_row` | no |
+| `btcell.of_int`, `of_float`, `of_str`, `of_blob`, `null_cell` | no |
+| `btcell.as_int`, `as_float`, `as_str`, `as_blob`, `is_null`, `tag` | no |
+| `btcell.encoded_size`, `encoded_row_size` | no |
+| `btcell.encode_cell`, `encode_row`, `decode_cell`, `decode_row` | no |
+| `btcell.show`, `show_row` | no |
 | `nodefmt.page_size`, `header_size`, `payload_size`, `fanout`, `split_at` | no |
 | `nodefmt.encode_header`, `kind_of`, `id_of` | no |
 | `nodefmt.encode_leaf`, `encode_inner`, `decode_leaf`, `decode_inner` | no |

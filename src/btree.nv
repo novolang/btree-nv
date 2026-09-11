@@ -43,7 +43,7 @@
 //     insert has to buy that back with the pager's copy-on-write, and
 //     `PrAllocPage` is where it is bought.
 
-use cell
+use btcell
 use nodefmt
 
 // What the tree needs the host to do before it can continue.
@@ -97,7 +97,7 @@ pub enum Op
 pub enum KeyedRow
     // A row, and the key it was stored under.  Only `OpLookup`,
     // `OpScanAll` and `OpRange` produce these.
-    SRow(key: Int, row: [cell.Cell])
+    SRow(key: Int, row: [btcell.Cell])
     // The operation finished.  `rows_affected` is 1 for an insert, 1
     // for a delete that found its key, 0 for a delete that did not,
     // and the row count for a scan.
@@ -134,7 +134,7 @@ pub struct Cursor
     low: Int
     high: Int
     // The row an insert is carrying, empty for every other op.
-    payload: [cell.Cell]
+    payload: [btcell.Cell]
     // Page ids from the root down to the page under the cursor.
     path: [Int]
     // The entry index reached within each page on `path`.
@@ -183,7 +183,7 @@ pub fn range(t: Tree, low: Int, high: Int) -> Cursor
 // — a `PrAllocPage` and a `PrWritePage` for each new node up to and
 // including a new root.  `tree_of` on the finished cursor is the tree
 // to keep: a split changes the root.
-pub fn insert(t: Tree, key: Int, row: [cell.Cell]) -> Cursor
+pub fn insert(t: Tree, key: Int, row: [btcell.Cell]) -> Cursor
     todo("btree-nv.btree.insert")
 
 // A cursor that will remove the row at `key`.

@@ -19,7 +19,7 @@
 
 use std.test
 use std.list
-use cell
+use btcell
 use btree
 use pageio
 
@@ -96,7 +96,7 @@ fn test_next_row_lets_a_limit_stop_early() [io]
 fn test_outcome_carries_the_tree_to_keep() [io]
     // After an insert that split the root, the root moved; the id in
     // `Outcome.tree` is the one the caller has to persist.
-    match pageio.run(empty_table(), btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)]))
+    match pageio.run(empty_table(), btree.insert(btree.open(1, 0, 1), 1, [btcell.of_int(1)]))
         Ok(out) => test.assert_eq(out.tree.root, 1)
         Err(f)  => test.assert_true(str.len(f.message()) > 0, "the fault says what failed")
 

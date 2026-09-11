@@ -10,7 +10,7 @@
 use std.test
 use std.list
 use std.str
-use cell
+use btcell
 use nodefmt
 use btree
 
@@ -144,7 +144,7 @@ fn test_range_carries_both_bounds_inclusive() [io]
 
 @test
 fn test_insert_carries_the_row_and_nothing_else_does() [io]
-    let row = [cell.of_int(1), cell.of_str("a")]
+    let row = [btcell.of_int(1), btcell.of_str("a")]
     let ins = btree.insert(btree.open(1, 0, 1), 5, row)
     test.assert_eq(list.len(ins.payload), 2)
     test.assert_eq(list.len(btree.delete(btree.open(1, 0, 1), 5).payload), 0)
@@ -175,7 +175,7 @@ fn test_tree_of_is_where_a_split_reports_the_new_root() [io]
     // must persist is the one on the FINISHED cursor.  A host that
     // re-opens on the old root after a split reads a tree missing a
     // level, so this accessor is not a convenience.
-    let c = btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)])
+    let c = btree.insert(btree.open(1, 0, 1), 1, [btcell.of_int(1)])
     test.assert_eq(btree.tree_of(c).root, 1)
 
 @test
@@ -183,5 +183,5 @@ fn test_feed_alloc_answers_the_allocation_the_write_path_asked_for() [io]
     // novodb has no counterpart to this: its paged tree is read-only
     // and its writes go through a whole-file rewrite.  The pairing is
     // designed here, so it is tested here.
-    let c = btree.insert(btree.open(1, 0, 1), 1, [cell.of_int(1)])
+    let c = btree.insert(btree.open(1, 0, 1), 1, [btcell.of_int(1)])
     test.assert_eq(btree.tree_of(btree.feed_alloc(c, 12)).root, 1)
