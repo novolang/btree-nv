@@ -1,6 +1,6 @@
 [package]
 name        = "btree-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "An ordered map over fixed-size pages, sans-IO: node layout, lookup, range scan, insert and delete run as pure state machines that ask for pages and hand pages back, and the host performs every read and every write."
 license     = "Apache-2.0"
 

@@ -4,6 +4,10 @@ Newest first.  Below `1.0.0` a breaking change bumps the **minor**
 number and a compatible one the **patch**; see [Version numbers in the
 Orbit package registry](https://novo-lang.org/docs/registry/semver.html).
 
+## 0.0.4 — 2026-09-15
+
+- README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.3 — 2026-09-12
 
 - **BREAKING — the `cell` module is now `btcell`.**  `cell` is a standard
