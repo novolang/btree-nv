@@ -11,12 +11,6 @@ every page it reads. [pager-nv](https://novo-lang.org/packages/pager-nv)
 and [sql-engine-nv](https://novo-lang.org/packages/sql-engine-nv) are
 built on it.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What it is
 
 A **B+ tree** stores every key and every value in its bottom row of
@@ -139,11 +133,6 @@ fn main() [io]
     println("${rows} rows")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: btree-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
-
 ## What the package contains
 
 | Module | Contents |
@@ -183,72 +172,84 @@ package.
 
 1. **Every operation is a cursor, and `step` answers one of four
    things.** `SRow` is a row and its key. `SDone` is the operation
-   finished, carrying the rows it affected. `SFailed` is a page that
-   did not decode. `SRequest` is the tree asking, and the caller
-   answers it with `feed_page` or `feed_alloc` and steps again.
-2. **`feed_page` takes a whole page, header included**, exactly
-   `nodefmt.page_size()` bytes long. The header's page id is checked
-   against the id that was asked for, and a disagreement finishes the
-   cursor with `IdMismatch`. That check is the cheapest detector there
-   is for a read that went to the wrong offset.
-3. **Keep the tree `btree.tree_of` answers after an insert.** An
-   insert that filled the root splits it, and the root moves to a new
-   page. The caller stores the new root id wherever the next `open`
-   will read it.
-4. **Deleting a key that is not there is not an error.** The cursor
-   finishes `SDone(0)`.
-5. **A cursor that has finished stays finished.** Stepping it again
+   finished, carrying the rows it produced or changed. `SFailed` is a
+   walk that stopped. `SRequest` is the tree asking, and the caller
+   answers `PrNeedPage` with `feed_page` and `PrAllocPage` with
+   `feed_alloc` before stepping again. `PrWritePage` and `PrFreePage`
+   need no answer. Stepping a cursor that waits asks again.
+2. **`feed_page` takes the whole page, header included.** A page
+   shorter than `nodefmt.page_size()` reads as though it were padded
+   with zeros, so a 16-byte leaf header is an empty leaf; a longer one
+   is refused. The header's page id is checked against the id that was
+   asked for, and a disagreement fails the cursor with `IdMismatch`.
+   That check is the cheapest detector there is for a read that went
+   to the wrong offset. A page the cursor did not ask for fails it with
+   `Unexpected`.
+3. **An insert or a delete asks for everything it needs, in order.**
+   After the descent it asks for each page a split needs, then writes
+   every changed node from the leaf up, a new root last, then frees
+   what is no longer reachable.
+4. **Keep the tree `btree.tree_of` answers after an insert or a
+   delete.** An insert that splits the root moves it to a new page,
+   and a delete that leaves the root one child moves it to that child.
+   The caller stores the new root id, height and size wherever the next
+   `open` will read them.
+5. **A node splits at 17 keys, 8 of them staying on the left.** A leaf
+   whose rows no longer fit one page is split by size instead, into as
+   many leaves as it takes. A delete that empties a leaf frees it and
+   removes it from its parent. Nodes are not merged below half full.
+6. **Deleting a key that is not there is not an error.** The cursor
+   finishes `SDone(0)` and writes nothing.
+7. **A cursor that has finished stays finished.** Stepping it again
    answers `SFailed(Finished)`, and a cursor that has failed repeats
    its failure on every later step.
-6. **Read a cell with the accessors, never by matching `Cell`.**
+8. **Read a cell with the accessors, never by matching `Cell`.**
    `as_int`, `as_float`, `as_str`, `as_blob` and `is_null` each answer
    `None` when the cell holds something else. A sixth storage class
    would then be one new arm here rather than one in every `match` in
    the calling program.
-7. **A row must fit one page on its own.** A row larger than the 4080
-   bytes of payload is refused with `RowTooLarge`, naming the key, the
-   bytes needed and the bytes available. There is no overflow-page
-   chain in this version.
-8. **`btcell.tag` is also a sort key.** The tag numbers in the cell
-   table above are the order SQL comparison uses when it has to order
-   values of different storage classes.
-9. **Nothing here is mutated.** A cursor comes back from `step` rather
-   than being changed in place, so a caller may hold two cursors over
-   one tree and know they cannot alias (SPEC section 14).
-10. **`btree.create` answers a request, not a tree.** A tree with no
+9. **A row must fit one page on its own.** A row whose entry, 12 bytes
+   of key and length and then the encoded row, does not fit the 4076
+   bytes a leaf has after its count is refused with `RowTooLarge`,
+   naming the key, the bytes needed and the bytes available. There is
+   no overflow-page chain in this version.
+10. **`btcell.tag` is also a sort key.** The tag numbers in the cell
+    table above are the order SQL comparison uses when it has to order
+    values of different storage classes.
+11. **Nothing is changed in place.** Every function answers a new
+    cursor and leaves the one it was given as it was, so a caller may
+    hold two cursors over one tree and know they cannot alias.
+12. **`btree.create` answers a request, not a tree.** A tree with no
     root page is not a tree, so an empty tree is made by performing
-    that one allocation and passing the id to `btree.open`.
-11. **The tree never decides what freeing a page means.**
+    that one allocation, writing an empty leaf there, and passing the id
+    to `btree.open`. Page id 0 is not a page.
+13. **The tree never decides what freeing a page means.**
     `PrFreePage` says a page is no longer reachable. Whether that is
-    reuse now or reuse at the next commit is the page store's
-    decision.
-
-## Running on a microcontroller
-
-The package declares no effects, and a program that calls it links for
-a device target. `novo build --target=nrf52-qemu` builds and links a
-program calling `nodefmt.page_size()`.
-
-A program that carries a page cannot be built for that tier today.
-Every function that takes or returns page bytes takes a `[Int]`, and
-the embedded tier refuses a list literal as an implicit heap
-allocation, with error E4000. A fixed-capacity page buffer is what
-would lift that, and it is not in this release.
+    reuse now or reuse at the next commit is the page store's decision.
+14. **A path deeper than 64 pages, or a page met twice on one path,
+    is a cycle.** The walk fails with `Cycle` rather than looping.
 
 ## What is not included
 
 - **Any input or output.** No file is opened, no page is read and no
   page is written. `PageRequest` is how the tree asks, and
   [pager-nv](https://novo-lang.org/packages/pager-nv) is what answers.
+- **A build for a microcontroller.** A page is a `[Int]`, a list, and
+  a cell holds text and lists, and the embedded tier refuses both as
+  heap allocations. A fixed-capacity page buffer is what would lift
+  that.
+- **Merging nodes below half full.** A lookup reads one page per level
+  whether a node is full or not, so a tree that shrank reads as many
+  pages as it did when it was larger.
 - **Overflow pages.** A row that does not fit one page is refused
-  rather than split across a chain. See rule 7.
+  rather than split across a chain. See rule 9.
 - **Keys other than `Int`.** A tree keyed by text needs a comparison
   function in the node format, and that is a format change rather than
   an addition.
 - **Transactions, locking and crash recovery.** Those belong to
   whatever owns the file. pager-nv has the write-ahead log.
 - **A free list.** The tree says a page is free and stops there. See
-  rule 11.
+  rule 13.
 - **A configurable page size.** `nodefmt.page_size()` is 4096 in this
   version. It is a function rather than a constant so that a later
   version can read it from a file header without any call site
@@ -278,48 +279,30 @@ would lift that, and it is not in this release.
 ## Tests
 
 ```bash
-novo test tests/btcell_tests.nv    #  9 tests: the cells and their bytes
+novo test tests/btcell_tests.nv    # 10 tests: the cells and their bytes
 novo test tests/nodefmt_tests.nv   # 10 tests: the page layout, by offset
-novo test tests/btree_tests.nv     # 12 tests: the request protocol, driven by hand
-novo test tests/pageio_tests.nv    #  5 tests: the driver and what it costs
+novo test tests/btree_tests.nv     # 18 tests: the tree against a sorted-list model
+novo test tests/pageio_tests.nv    #  6 tests: the drivers and what they cost
+bash tests/coverage.sh             # line coverage over src/
 ```
 
-The reference data is the format above. `nodefmt_tests.nv` asserts the
-byte offsets one at a time, because a page written by one version and
-read by another is the format or it is nothing. `btree_tests.nv` is
-written the way a host writes: a loop that steps a cursor, answers
-what it asks for, and steps again. `pageio_tests.nv` supplies a page
-table in memory as an `impl PageIo[]` and checks that a walk over it
-is charged no effect, which the compiler decides before the run
-starts.
-
-The tests compile today and fail at run, each on the
-`not implemented: btree-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at
-a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `nodefmt.KIND_LEAF`, `.KIND_INNER` | yes (they are constants) |
-| `btcell.of_int`, `.of_float`, `.of_str`, `.of_blob`, `.null_cell` | no |
-| `btcell.as_int`, `.as_float`, `.as_str`, `.as_blob`, `.is_null`, `.tag` | no |
-| `btcell.encoded_size`, `.encoded_row_size` | no |
-| `btcell.encode_cell`, `.encode_row`, `.decode_cell`, `.decode_row` | no |
-| `btcell.show`, `.show_row`, `CellError.message` | no |
-| `nodefmt.page_size`, `.header_size`, `.payload_size`, `.fanout`, `.split_at` | no |
-| `nodefmt.encode_header`, `.kind_of`, `.id_of` | no |
-| `nodefmt.encode_leaf`, `.encode_inner`, `.decode_leaf`, `.decode_inner` | no |
-| `nodefmt.leaf_encoded_size`, `.inner_encoded_size`, `.seek`, `.child_for` | no |
-| `nodefmt.NodeError.message` | no |
-| `btree.open`, `.create`, `.lookup`, `.scan`, `.range`, `.insert`, `.delete` | no |
-| `btree.step`, `.feed_page`, `.feed_alloc`, `.awaiting`, `.tree_of` | no |
-| `btree.BtreeError.message` | no |
-| `pageio.run`, `.next_row`, `IoFault.message` | no |
+The reference data is the format above. `btcell_tests.nv` and
+`nodefmt_tests.nv` assert the bytes of each cell and of each page
+offset by offset, and every way a buffer can fail to decode.
+`btree_tests.nv` runs random inserts and deletes against the tree and
+against a sorted list of keys at once, answering every request from
+pages held in a list the way a page store would. After every
+operation it reads the whole tree back and checks that every leaf is
+at the same depth, that keys ascend within each leaf, that every key
+under an inner node lies between the separators around it, that no
+node holds more than 16 keys, and that the keys and their values are
+the model's. The runs reach three levels, split leaves by size with
+1500-byte rows, and delete until leaves empty and the root gives way.
+`pageio_tests.nv` supplies a page table in memory as an
+`impl PageIo[]` and checks that a walk over it is charged no effect,
+which the compiler decides before the run starts.
 
 ## Licence
 
 Apache-2.0. See `LICENSE`.
 
-<!-- docs/writing-a-readme.md is the style guide for this page. -->

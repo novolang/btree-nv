@@ -1,19 +1,17 @@
 [package]
 name        = "btree-nv"
-version     = "0.0.4"
+version     = "0.1.0"
 description = "An ordered map over fixed-size pages, sans-IO: node layout, lookup, range scan, insert and delete run as pure state machines that ask for pages and hand pages back, and the host performs every read and every write."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet.
+stability   = "experimental"
 
 # `core`: the tree is arithmetic over page bytes the caller already
-# holds.  It never opens a file — `PageRequest` is how it asks, and
-# `pager-nv` is what answers.
+# holds.  It never opens a file: `PageRequest` is how it asks, and a
+# page store such as pager-nv answers.  There is no device build,
+# because a page is a list; the README says so.
 layer       = "core"
 
 category    = "databases"
@@ -21,7 +19,7 @@ tags        = ["btree", "b+tree", "ordered-map", "pages", "sans-io", "sqlite", "
 repository  = "https://github.com/novolang/btree-nv"
 bugs        = "https://github.com/novolang/btree-nv/issues"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -30,5 +28,4 @@ novo        = ">= 0.8.9"
 "README.md" = "The page-request loop, the node format, and what the tree asks for"
 
 [dependencies]
-# None.  A B-tree that depended on anything would be a B-tree that
-# could not go in firmware.
+# None.  The tree needs the standard library and nothing else.
