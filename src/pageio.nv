@@ -75,7 +75,8 @@ pub fn run<S: PageIo[e]>(io: S, start: btree.Cursor) -> Result<Outcome, IoFault>
                 list.push(rows, r[:])
             SDone(n)    =>
                 return Ok(Outcome { rows: rows, keys: keys, rows_affected: n, tree: btree.tree_of(c) })
-            SFailed(e)  => return Err(Walk(cause: e))
+            SFailed(e)  =>
+                return Err(Walk(cause: e))
             SRequest(_) => ()
 
 // Perform the request a step made, if it made one, and answer the
@@ -103,9 +104,12 @@ pub fn next_row<S: PageIo[e]>(io: S, c: btree.Cursor) -> Result<?NextRow, IoFaul
         let p = btree.step(cur)
         cur = answer(io, p)!
         match p.step
-            SRow(k, r)  => return Ok(Some(NextRow { key: k, row: r[:], cursor: cur }))
-            SDone(_)    => return Ok(None)
-            SFailed(e)  => return Err(Walk(cause: e))
+            SRow(k, r)  =>
+                return Ok(Some(NextRow { key: k, row: r[:], cursor: cur }))
+            SDone(_)    =>
+                return Ok(None)
+            SFailed(e)  =>
+                return Err(Walk(cause: e))
             SRequest(_) => ()
 
 // One row, its key, and the cursor to continue from.

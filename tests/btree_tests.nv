@@ -1,187 +1,455 @@
-// btree_tests.nv — the page-request protocol, driven by hand.
+// btree_tests.nv — the tree against a sorted-list model.
 //
-// EVERY TEST HERE FAILS TODAY: btree-nv is published as its interface
-// and every body is `todo()`.  The file is written the way a HOST
-// writes against this package — a loop that steps a cursor, answers
-// whatever it asks for, and steps again — because that loop is the
-// interface, and an interface nobody has written a caller for has not
-// been reviewed.
+// A driver answers every request from pages held in a list, the way a
+// page store would.  Random inserts and deletes run against the tree
+// and against a sorted list of keys at once, and after every operation
+// the whole tree is read back and checked: every leaf at the same
+// depth, keys ascending within each leaf, every key under an inner
+// node between the separators around it, no node over the key limit,
+// and the keys equal to the model's, each with the value the model
+// holds.
 
 use std.test
-use std.list
-use std.str
 use btcell
 use nodefmt
 use btree
 
-// One stored page: the smallest thing that can answer a `PrNeedPage`.
-struct Slot
-    id: Int
-    bytes: [Int]
+// ── an in-memory page store ─────────────────────────────────────────
 
-fn slot_bytes(slots: [Slot], id: Int) -> ?[Int]
-    match list.find(slots, s => s.id == id)
-        Some(s) => Some(s.bytes)
-        None    => None
+// The pages, indexed by id.  Page 0 is never handed out.
+struct Store
+    var pages: [[Int]]
+    var freed: [Int]
 
-// What one drive of a cursor did, so a test can assert on the shape of
-// the traffic rather than only on the answer.
+fn new_store() -> Store
+    Store { pages: [[]], freed: [] }
+
+// What one drive did.
 struct Drive
+    var rows: [[btcell.Cell]]
+    var keys: [Int]
     affected: Int
     writes: Int
     allocs: Int
     frees: Int
-    stalled: Bool
+    tree: btree.Tree
+    failed: ?btree.BtreeError
 
-// KeyedRow a cursor to `SDone`, answering reads from `slots` and counting
-// everything else.  `guard` is what stops a walk that asks for a page
-// nobody has: the loop gives up and says so rather than spinning.
-fn drive(start: btree.Cursor, slots: [Slot]) -> Drive
+// Run a cursor to its end, answering from and into `s`.
+fn drive(var s: Store, start: btree.Cursor) -> Drive
     var c = start
-    var affected = 0 - 1
+    var rows: [[btcell.Cell]] = []
+    var keys: [Int] = []
     var writes = 0
     var allocs = 0
     var frees = 0
-    var stalled = false
-    var going = true
-    var guard = 0
-    while going and guard < 64
-        guard += 1
+    loop
         let p = btree.step(c)
         c = p.cursor
         match p.step
-            SDone(n)    =>
-                affected = n
-            SFailed(e)  =>
-                going = false
             SRow(k, r)  =>
-                going = true
+                list.push(keys, k)
+                list.push(rows, r[:])
+            SDone(n)    =>
+                return Drive { rows: rows, keys: keys, affected: n, writes: writes, allocs: allocs,
+                    frees: frees, tree: btree.tree_of(c), failed: None }
+            SFailed(e)  =>
+                return Drive { rows: rows, keys: keys, affected: 0 - 1, writes: writes, allocs: allocs,
+                    frees: frees, tree: btree.tree_of(c), failed: Some(e) }
             SRequest(q) =>
                 match q
                     PrNeedPage(id)    =>
-                        match slot_bytes(slots, id)
-                            Some(b) =>
-                                c = btree.feed_page(c, id, b)
-                            None    =>
-                                stalled = true
+                        let b = s.pages[id]
+                        c = btree.feed_page(c, id, b)
                     PrWritePage(i, b) =>
-                        writes += 1
+                        s.pages[i] = b[:]
+                        writes = writes + 1
                     PrAllocPage(k)    =>
-                        allocs += 1
+                        list.push(s.pages, nodefmt.encode_header(k, list.len(s.pages)))
+                        allocs = allocs + 1
+                        c = btree.feed_alloc(c, list.len(s.pages) - 1)
                     PrFreePage(i)     =>
-                        frees += 1
-        if affected >= 0 or stalled
-            going = false
-    Drive { affected: affected, writes: writes, allocs: allocs, frees: frees, stalled: stalled }
+                        list.push(s.freed, i)
+                        frees = frees + 1
+
+// A store holding one empty leaf, and the tree rooted on it.
+fn empty_tree(var s: Store) -> btree.Tree
+    match btree.create()
+        PrAllocPage(k) =>
+            list.push(s.pages, nodefmt.encode_header(k, 1))
+            btree.open(1, 0, 1)
+        _              => btree.open(0 - 1, 0, 0)
+
+fn row_of(v: Int, pad: Int) -> [btcell.Cell]
+    [btcell.of_int(v), btcell.of_str(str.repeat("x", pad))]
+
+// ── invariants ──────────────────────────────────────────────────────
+
+// Every key under the node at `id`, in order, checked against the
+// bounds `[lo, hi)` its parents set.  `depth` counts from 1 at the
+// root, and each leaf's depth is added to `leaf_depths`.
+fn collect(s: Store, id: Int, lo: Int, hi: Int, depth: Int, var keys: [Int], var vals: [Int],
+           var leaf_depths: [Int]) -> Str
+    let page = s.pages[id]
+    if nodefmt.kind_of(page) == Some(nodefmt.KIND_INNER)
+        match nodefmt.decode_inner(page)
+            Ok(n)  =>
+                if list.len(n.separators) > nodefmt.fanout()
+                    return "inner ${id} holds ${list.len(n.separators)} separators"
+                for i in 0..list.len(n.children)
+                    let a = if i == 0
+                        lo
+                    else
+                        n.separators[i - 1]
+                    let b = if i == list.len(n.separators)
+                        hi
+                    else
+                        n.separators[i]
+                    if a > b
+                        return "inner ${id}: separators out of order"
+                    let why = collect(s, n.children[i], a, b, depth + 1, keys, vals, leaf_depths)
+                    if why != ""
+                        return why
+                return ""
+            Err(e) =>
+                return e.message()
+    match nodefmt.decode_leaf(page)
+        Ok(l)  =>
+            if list.len(l.keys) > nodefmt.fanout()
+                return "leaf ${id} holds ${list.len(l.keys)} keys"
+            for i in 0..list.len(l.keys)
+                let k = l.keys[i]
+                if k < lo or k >= hi
+                    return "leaf ${id}: key ${k} outside [${lo}, ${hi})"
+                if i > 0 and l.keys[i - 1] >= k
+                    return "leaf ${id}: keys out of order"
+                list.push(keys, k)
+                list.push(vals, btcell.as_int(l.rows[i][0]) ?? 0 - 1)
+            list.push(leaf_depths, depth)
+            ""
+        Err(e) => e.message()
+
+// The first way the tree disagrees with the model, or "".
+fn check(s: Store, t: btree.Tree, model_keys: [Int], model_vals: [Int]) -> Str
+    var keys: [Int] = []
+    var vals: [Int] = []
+    var depths: [Int] = []
+    let why = collect(s, t.root, 0 - 9223372036854775807 - 1, 9223372036854775807, 1, keys,
+        vals, depths)
+    if why != ""
+        return why
+    for d in depths
+        if d != t.height
+            return "a leaf at depth ${d} in a tree of height ${t.height}"
+    if keys != model_keys
+        return "keys ${keys} but the model holds ${model_keys}"
+    if vals != model_vals
+        return "values differ from the model"
+    if t.size != list.len(model_keys)
+        return "size ${t.size} but the model holds ${list.len(model_keys)}"
+    ""
+
+// A small linear congruential generator, so a failure repeats.
+fn next_seed(x: Int) -> Int
+    (x * 1103515245 + 12345) % 2147483648
+
+// ── the property ────────────────────────────────────────────────────
+
+// What a model run saw: the first disagreement, or "", and how far the
+// tree was pushed.
+struct Seen
+    why: Str
+    max_height: Int
+    frees: Int
+    shrinks: Int
+
+// `ops` operations on keys in `[0, span)`.  Until step `grow`, one in
+// four is a delete; from then on every one is.  One row in `big_every`
+// carries 1500 bytes, when `big_every` is positive.
+fn run_model(seed0: Int, ops: Int, span: Int, big_every: Int, grow: Int) -> Seen
+    var s = new_store()
+    var max_height = 1
+    var frees = 0
+    var shrinks = 0
+    var t = empty_tree(s)
+    var mk: [Int] = []
+    var mv: [Int] = []
+    var seed = seed0
+    for step in 0..ops
+        seed = next_seed(seed)
+        let key = (seed >>> 4) % span
+        seed = next_seed(seed)
+        let deleting = seed % 4 == 0 or step >= grow
+        let pad = if big_every > 0 and seed % big_every == 1
+            1500
+        else
+            seed % 40
+        let i = nodefmt.seek(mk, key)
+        let there = i < list.len(mk) and mk[i] == key
+        if deleting
+            let d = drive(s, btree.delete(t, key))
+            if d.affected != (if there then 1 else 0)
+                return seen("step ${step}: delete ${key} affected ${d.affected}")
+            frees = frees + d.frees
+            if d.tree.height < t.height
+                shrinks = shrinks + 1
+            if there
+                mk = list.concat(list.slice(mk, 0, i), list.slice(mk, i + 1, list.len(mk)))
+                mv = list.concat(list.slice(mv, 0, i), list.slice(mv, i + 1, list.len(mv)))
+            t = d.tree
+        else
+            let d = drive(s, btree.insert(t, key, row_of(step, pad)))
+            if d.affected != 1
+                return seen("step ${step}: insert ${key} affected ${d.affected}")
+            if there
+                mv[i] = step
+            else
+                mk = list.concat(list.concat(list.slice(mk, 0, i), [key]), list.slice(mk, i, list.len(mk)))
+                mv = list.concat(list.concat(list.slice(mv, 0, i), [step]), list.slice(mv, i, list.len(mv)))
+            t = d.tree
+        if t.height > max_height
+            max_height = t.height
+        let why = check(s, t, mk, mv)
+        if why != ""
+            return seen("step ${step}: ${why}")
+    // A scan reads back what the model holds.
+    let all = drive(s, btree.scan(t))
+    if all.keys != mk
+        return seen("the scan answered ${all.keys}")
+    if all.tree.size != list.len(mk)
+        return seen("the scan counted ${all.tree.size}")
+    Seen { why: "", max_height: max_height, frees: frees, shrinks: shrinks }
+
+fn seen(why: Str) -> Seen
+    Seen { why: why, max_height: 0, frees: 0, shrinks: 0 }
 
 @test
-fn test_open_names_the_root_page() [io]
+fn test_small_rows_through_several_levels()
+    let r = run_model(7, 400, 300, 0, 400)
+    test.assert_eq(r.why, "")
+    test.assert_eq(r.max_height >= 3, true)
+
+@test
+fn test_rows_large_enough_to_split_a_leaf_by_size()
+    let r = run_model(11, 200, 60, 3, 200)
+    test.assert_eq(r.why, "")
+    test.assert_eq(r.max_height >= 2, true)
+
+@test
+fn test_deletes_that_empty_leaves_and_collapse_the_root()
+    // Three hundred operations that grow the tree, then a thousand
+    // deletes over the same keys, which empty it again.
+    let r = run_model(3, 1300, 120, 0, 300)
+    test.assert_eq(r.why, "")
+    test.assert_eq(r.frees > 0, true)
+    test.assert_eq(r.shrinks > 0, true)
+
+// ── the protocol, step by step ──────────────────────────────────────
+
+@test
+fn test_open_names_the_root_page()
     let t = btree.open(1, 0, 1)
     test.assert_eq(t.root, 1)
     test.assert_eq(t.size, 0)
     test.assert_eq(t.height, 1)
 
 @test
-fn test_create_asks_for_a_leaf_page_first() [io]
-    // A tree with no root is not a `Tree`, so `create` hands back the
-    // request instead of a tree: the host allocates, then `open`s.
+fn test_create_asks_for_a_leaf_page_first()
     match btree.create()
-        PrAllocPage(k)    => test.assert_eq(k, nodefmt.KIND_LEAF)
-        PrNeedPage(p)     => test.fail("a new tree has no page to read")
-        PrWritePage(p, b) => test.fail("a new tree has nothing to write yet")
-        PrFreePage(p)     => test.fail("a new tree has nothing to free")
+        PrAllocPage(k) => test.assert_eq(k, nodefmt.KIND_LEAF)
+        _              => test.fail("a new tree starts with an allocation")
 
 @test
-fn test_a_lookup_asks_for_the_root_before_anything_else() [io]
-    // The first step of every walk is the same: the descent cannot
-    // decide which page it wants second until it has the first.
-    let c = btree.lookup(btree.open(4, 1, 1), 42)
-    match btree.step(c).step
-        SRequest(q) =>
-            match q
-                PrNeedPage(id)    => test.assert_eq(id, 4)
-                PrWritePage(i, b) => test.fail("a lookup writes nothing")
-                PrAllocPage(k)    => test.fail("a lookup allocates nothing")
-                PrFreePage(i)     => test.fail("a lookup frees nothing")
-        SRow(k, r)  => test.fail("no page has been read yet")
-        SDone(n)    => test.fail("no page has been read yet")
-        SFailed(e)  => test.fail(e.message())
+fn test_a_lookup_asks_for_the_root_before_anything_else()
+    let p = btree.step(btree.lookup(btree.open(4, 1, 1), 42))
+    match p.step
+        SRequest(PrNeedPage(id)) => test.assert_eq(id, 4)
+        _                        => test.fail("the first step asks for the root")
+    test.assert_eq(btree.awaiting(p.cursor) ?? 0, 4)
+    // Stepping again without feeding asks again.
+    match btree.step(p.cursor).step
+        SRequest(PrNeedPage(id)) => test.assert_eq(id, 4)
+        _                        => test.fail("the cursor still waits for page 4")
+    test.assert_eq(btree.awaiting(btree.lookup(btree.open(1, 0, 1), 1)) == None, true)
 
 @test
-fn test_awaiting_names_the_page_the_cursor_is_blocked_on() [io]
-    // A host driving several cursors batches its reads off this; one
-    // driving them singly never calls it.  Both are supported, which is
-    // the reason the protocol is data rather than a callback.
-    let p = btree.step(btree.scan(btree.open(9, 0, 1)))
-    test.assert_eq(btree.awaiting(p.cursor), Some(9))
+fn test_a_lookup_answers_the_row_then_one_and_a_miss_answers_zero()
+    var s = new_store()
+    let t0 = empty_tree(s)
+    let t = drive(s, btree.insert(t0, 5, row_of(50, 0))).tree
+    let hit = drive(s, btree.lookup(t, 5))
+    test.assert_eq(hit.affected, 1)
+    test.assert_eq(btcell.as_int(hit.rows[0][0]) ?? 0, 50)
+    test.assert_eq(drive(s, btree.lookup(t, 6)).affected, 0)
+    let r = drive(s, btree.range(t, 0, 4))
+    test.assert_eq(r.affected, 0)
 
 @test
-fn test_a_cursor_not_waiting_awaits_nothing() [io]
-    test.assert_none(btree.awaiting(btree.lookup(btree.open(1, 0, 1), 1)))
+fn test_a_range_past_the_last_key_ends_with_the_tree()
+    var s = new_store()
+    var t = empty_tree(s)
+    for k in 0..30
+        t = drive(s, btree.insert(t, k, row_of(k, 0))).tree
+    let r = drive(s, btree.range(t, 25, 1000))
+    test.assert_eq(r.keys, [25, 26, 27, 28, 29])
+    // A range does not learn the tree's size; a scan does.
+    test.assert_eq(r.tree.size, 30)
 
 @test
-fn test_feeding_a_page_the_cursor_did_not_ask_for_is_an_error() [io]
-    // The host and the tree agree on exactly one outstanding request.
-    // A host that answers the wrong one has a bug the tree can see, and
-    // reading the wrong page as the right one is how a walk silently
-    // returns another table's rows.
-    let p = btree.step(btree.scan(btree.open(9, 0, 1)))
-    let bad = btree.feed_page(p.cursor, 11, [])
-    match btree.step(bad).step
-        SFailed(e)  => test.assert_true(str.len(e.message()) > 0, "it names both ids")
-        SRow(k, r)  => test.fail("a mis-fed page must not produce a row")
-        SDone(n)    => test.fail("a mis-fed page must not finish the walk")
-        SRequest(q) => test.fail("a mis-fed page must not be ignored")
+fn test_an_inner_node_left_with_no_child_is_freed_too()
+    // Root 1 over inner 2 (one child, leaf 4 holding key 1) and leaf 3
+    // (key 9).  Deleting 1 frees 4, then 2, and the root gives way.
+    var s = new_store()
+    let pages = [inner_page(1, [5], [2, 3]), inner_page(2, [], [4]), leaf_page(3, [9]),
+        leaf_page(4, [1])]
+    for p in pages
+        list.push(s.pages, p[:])
+    let d = drive(s, btree.delete(btree.open(1, 2, 3), 1))
+    test.assert_eq(d.affected, 1)
+    test.assert_eq(s.freed, [4, 2, 1])
+    test.assert_eq(d.tree.root, 3)
+    test.assert_eq(d.tree.height, 2)
+    test.assert_eq(d.tree.size, 1)
+
+fn inner_page(id: Int, seps: [Int], kids: [Int]) -> [Int]
+    match nodefmt.encode_inner(id, Inner { separators: seps, children: kids })
+        Ok(b)  => b
+        Err(_) => []
+
+fn leaf_page(id: Int, keys: [Int]) -> [Int]
+    var rows: [[btcell.Cell]] = []
+    for k in keys
+        list.push(rows, row_of(k, 0))
+    match nodefmt.encode_leaf(id, Leaf { keys: keys, rows: rows })
+        Ok(b)  => b
+        Err(_) => []
 
 @test
-fn test_range_carries_both_bounds_inclusive() [io]
-    let c = btree.range(btree.open(1, 100, 2), 10, 20)
-    test.assert_eq(btree.tree_of(c).root, 1)
-    // The bounds are inclusive at both ends, which is novodb's
-    // `btree_range` and what a `BETWEEN` lowers to without a fixup.
+fn test_a_range_stops_at_its_upper_bound()
+    var s = new_store()
+    var t = empty_tree(s)
+    for k in 0..40
+        t = drive(s, btree.insert(t, k * 2, row_of(k, 0))).tree
+    let r = drive(s, btree.range(t, 11, 20))
+    test.assert_eq(r.keys, [12, 14, 16, 18, 20])
+    test.assert_eq(r.affected, 5)
+    let c = btree.range(t, 10, 20)
     test.assert_eq(c.low, 10)
     test.assert_eq(c.high, 20)
 
 @test
-fn test_insert_carries_the_row_and_nothing_else_does() [io]
-    let row = [btcell.of_int(1), btcell.of_str("a")]
-    let ins = btree.insert(btree.open(1, 0, 1), 5, row)
-    test.assert_eq(list.len(ins.payload), 2)
-    test.assert_eq(list.len(btree.delete(btree.open(1, 0, 1), 5).payload), 0)
-    test.assert_eq(list.len(btree.scan(btree.open(1, 0, 1)).payload), 0)
+fn test_a_finished_cursor_stays_finished()
+    var s = new_store()
+    let t = empty_tree(s)
+    var c = btree.scan(t)
+    var p = btree.step(c)
+    c = btree.feed_page(p.cursor, 1, s.pages[1])
+    p = btree.step(c)
+    match p.step
+        SDone(n) => test.assert_eq(n, 0)
+        _        => test.fail("an empty leaf has no rows")
+    match btree.step(p.cursor).step
+        SFailed(e) => test.assert_eq(e.message(), "btree: the cursor has finished")
+        _          => test.fail("a finished cursor answers Finished")
 
 @test
-fn test_delete_of_an_absent_key_finishes_at_zero_and_does_not_fail() [io]
-    // A DELETE that matched nothing is a statement that affected no
-    // rows, not an error — the SQL engine reports `SDone(0)` upward.
-    let root = nodefmt.encode_header(nodefmt.KIND_LEAF, 1)
-    let d = drive(btree.delete(btree.open(1, 0, 1), 404), [Slot { id: 1, bytes: root }])
-    test.assert_false(d.stalled, "the walk asked only for pages the fixture has")
+fn test_feeding_a_page_the_cursor_did_not_ask_for_is_an_error()
+    let p = btree.step(btree.scan(btree.open(9, 0, 1)))
+    let bad = btree.feed_page(p.cursor, 11, [])
+    match btree.step(bad).step
+        SFailed(e) => test.assert_eq(e.message(), "btree: fed 11 while waiting for 9")
+        _          => test.fail("a mis-fed page fails the cursor")
+    // A failed cursor ignores what it is fed and repeats its failure.
+    let again = btree.feed_page(btree.feed_alloc(bad, 3), 9, [])
+    match btree.step(again).step
+        SFailed(e) => test.assert_eq(e.message(), "btree: fed 11 while waiting for 9")
+        _          => test.fail("the failure repeats")
+    let early = btree.feed_alloc(btree.insert(btree.open(1, 0, 1), 1, row_of(1, 0)), 12)
+    match btree.step(early).step
+        SFailed(e) => test.assert_eq(e.message(), "btree: fed 12 while waiting for 0")
+        _          => test.fail("nothing was allocated yet")
+
+fn first_failure(start: btree.Cursor, id: Int, bytes: [Int]) -> Str
+    let p = btree.step(start)
+    let c = btree.feed_page(p.cursor, id, bytes)
+    match btree.step(c).step
+        SFailed(e) => e.message()
+        _          => "no failure"
+
+@test
+fn test_a_page_that_is_not_the_node_asked_for_fails_the_walk()
+    let t = btree.open(2, 0, 1)
+    test.assert_eq(first_failure(btree.scan(t), 2, [6]),
+        "btree: page 2: nodefmt: a page of 1 bytes, not 4096")
+    test.assert_eq(first_failure(btree.scan(t), 2, nodefmt.encode_header(nodefmt.KIND_LEAF, 3)),
+        "btree: page 2: nodefmt: the page says it is 3, and 2 was asked for")
+    test.assert_eq(first_failure(btree.scan(t), 2, nodefmt.encode_header(1, 2)),
+        "btree: page 2: nodefmt: page kind 1, not 6")
+    let loop_page = match nodefmt.encode_inner(2, Inner { separators: [], children: [2] })
+        Ok(b)  => b
+        Err(_) => []
+    var s = new_store()
+    list.push(s.pages, [])
+    list.push(s.pages, loop_page[:])
+    let d = drive(s, btree.scan(t))
+    test.assert_eq(d.failed == Some(Cycle(page_id: 2, depth: 2)), true)
+
+@test
+fn test_a_row_too_large_for_a_page_fails_the_insert()
+    var s = new_store()
+    let t = empty_tree(s)
+    let d = drive(s, btree.insert(t, 1, row_of(1, 5000)))
+    match d.failed
+        Some(RowTooLarge(k, need, have)) =>
+            test.assert_eq(k, 1)
+            test.assert_eq(have, 4080)
+            test.assert_eq(need > have, true)
+        _                                => test.fail("5000 bytes do not fit 4080")
+
+@test
+fn test_a_delete_that_changes_nothing_writes_nothing()
+    var s = new_store()
+    let t = empty_tree(s)
+    let d = drive(s, btree.delete(t, 404))
     test.assert_eq(d.affected, 0)
+    test.assert_eq(d.writes + d.allocs + d.frees, 0)
 
 @test
-fn test_a_delete_that_changes_nothing_writes_nothing() [io]
-    // A write the tree did not need is a page the pager has to journal
-    // and fsync, so "did it write" is behaviour and not an internal.
-    let root = nodefmt.encode_header(nodefmt.KIND_LEAF, 1)
-    let d = drive(btree.delete(btree.open(1, 0, 1), 404), [Slot { id: 1, bytes: root }])
-    test.assert_eq(d.writes, 0)
-    test.assert_eq(d.allocs, 0)
-    test.assert_eq(d.frees, 0)
+fn test_a_split_of_the_root_moves_it_and_keeps_eight_on_the_left()
+    var s = new_store()
+    var t = empty_tree(s)
+    for k in 0..16
+        t = drive(s, btree.insert(t, k, row_of(k, 0))).tree
+    test.assert_eq(t.root, 1)
+    let d = drive(s, btree.insert(t, 16, row_of(16, 0)))
+    test.assert_eq(d.allocs, 2)
+    test.assert_eq(d.writes, 3)
+    test.assert_eq(d.tree.root, 3)
+    test.assert_eq(d.tree.height, 2)
+    match nodefmt.decode_leaf(s.pages[1])
+        Ok(l)  => test.assert_eq(list.len(l.keys), nodefmt.split_at())
+        Err(e) => test.fail(e.message())
+    // The insert cursor's tree is the old one until it finishes.
+    test.assert_eq(btree.tree_of(btree.insert(t, 17, row_of(17, 0))).root, 1)
 
 @test
-fn test_tree_of_is_where_a_split_reports_the_new_root() [io]
-    // An insert that splits the root moves it, and the id the caller
-    // must persist is the one on the FINISHED cursor.  A host that
-    // re-opens on the old root after a split reads a tree missing a
-    // level, so this accessor is not a convenience.
-    let c = btree.insert(btree.open(1, 0, 1), 1, [btcell.of_int(1)])
-    test.assert_eq(btree.tree_of(c).root, 1)
+fn test_an_inconsistent_plan_fails_at_its_write()
+    // A cursor built by hand whose plan writes a leaf too large for a
+    // page: the write fails the walk rather than sending bad bytes.
+    let big = Leaf { keys: [1, 2], rows: [row_of(1, 3000), row_of(2, 3000)] }
+    let t = btree.open(1, 0, 1)
+    let c = Cursor { tree: t, op: OpInsert, low: 1, high: 1, payload: [], path: [], nodes: [],
+        slots: [], started: true, awaiting_page: 0, affected: 1, applying: true, allocs: [],
+        fresh: [], writes: [BtWrite { page_id: 1, node: BtLeaf(leaf: big) }], frees: [],
+        next: t, failed: None }
+    match btree.step(c).step
+        SFailed(e) => test.assert_eq(str.contains(e.message(), "needs"), true)
+        _          => test.fail("the leaf does not fit a page")
 
 @test
-fn test_feed_alloc_answers_the_allocation_the_write_path_asked_for() [io]
-    // novodb has no counterpart to this: its paged tree is read-only
-    // and its writes go through a whole-file rewrite.  The pairing is
-    // designed here, so it is tested here.
-    let c = btree.insert(btree.open(1, 0, 1), 1, [btcell.of_int(1)])
-    test.assert_eq(btree.tree_of(btree.feed_alloc(c, 12)).root, 1)
+fn test_every_walk_failure_has_its_sentence()
+    let all = [Unexpected(fed: 1, wanted: 2), Cycle(page_id: 3, depth: 4),
+        RowTooLarge(key: 5, need: 6, have: 7), Finished,
+        BadNode(page_id: 8, cause: WrongKind(got: 1, want: 6))]
+    for e in all
+        test.assert_eq(str.starts_with(e.message(), "btree: "), true)

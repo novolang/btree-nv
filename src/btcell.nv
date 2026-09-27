@@ -168,7 +168,7 @@ fn get_be(buf: [Int], offset: Int, n: Int) -> Int
 fn need(buf: [Int], offset: Int, want: Int) -> Result<Unit, CellError>
     let have = list.len(buf) - offset
     if have < want
-        return Err(Truncated(offset: offset, want: want, have: if have < 0 then 0 else have))
+        return Err(Truncated(offset: offset, want: want, have: (if have < 0 then 0 else have)))
     Ok(())
 
 // Decode the cell that starts at `offset`, or say how the bytes were
@@ -238,15 +238,27 @@ fn utf8_len(buf: [Int], i: Int, to: Int) -> Int
         need = 1
     else if c0 >= 224 and c0 <= 239
         need = 2
-        lo = if c0 == 224 then 160 else 128
-        hi = if c0 == 237 then 159 else 191
+        lo = if c0 == 224
+            160
+        else
+            128
+        hi = if c0 == 237
+            159
+        else
+            191
     else if c0 >= 240 and c0 <= 244
         need = 3
-        lo = if c0 == 240 then 144 else 128
-        hi = if c0 == 244 then 143 else 191
+        lo = if c0 == 240
+            144
+        else
+            128
+        hi = if c0 == 244
+            143
+        else
+            191
     else
         return 0
-    if i + need >= to + 1
+    if i + need >= to
         return 0
     if buf[i + 1] < lo or buf[i + 1] > hi
         return 0
@@ -287,10 +299,10 @@ pub enum CellError
 impl Error for CellError
     fn message(self) -> Str
         match self
-            BadTag(o, t)          => "btcell: tag ${t} at byte ${o} is not a storage class"
-            Truncated(o, w, h)    => "btcell: ${w} byte(s) needed at byte ${o}, ${h} left"
-            BadUtf8(o)            => "btcell: text is not UTF-8 at byte ${o}"
-            ByteOutOfRange(o, v)  => "btcell: blob byte ${v} at ${o} is outside 0 to 255"
+            BadTag(o, t)         => "btcell: tag ${t} at byte ${o} is not a storage class"
+            Truncated(o, w, h)   => "btcell: ${w} byte(s) needed at byte ${o}, ${h} left"
+            BadUtf8(o)           => "btcell: text is not UTF-8 at byte ${o}"
+            ByteOutOfRange(o, v) => "btcell: blob byte ${v} at ${o} is outside 0 to 255"
 
 // The cell as SQL text: an integer bare, a float as novo-lang prints
 // it, text single-quoted with each quote doubled, a blob as `X'aabb'`,

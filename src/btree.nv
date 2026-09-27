@@ -278,10 +278,13 @@ fn walk(c0: Cursor) -> Progress
                 c = pop(c)
             BtLeaf(leaf)   =>
                 match c.op
-                    OpLookup  => return at_lookup(c, leaf)
-                    OpInsert  => return plan_insert(c, leaf)
-                    OpDelete  => return plan_delete(c, leaf)
-                    _         =>
+                    OpLookup =>
+                        return at_lookup(c, leaf)
+                    OpInsert =>
+                        return plan_insert(c, leaf)
+                    OpDelete =>
+                        return plan_delete(c, leaf)
+                    _        =>
                         if slot < list.len(leaf.keys)
                             return at_scan(c, leaf, slot)
                         c = pop(c)
@@ -342,7 +345,7 @@ pub fn feed_page(c: Cursor, page_id: Int, bytes: [Int]) -> Cursor
         return c
     if c.awaiting_page == 0 or page_id != c.awaiting_page
         return fail(c, Unexpected(fed: page_id, wanted: c.awaiting_page))
-    let got = nodefmt.id_of(bytes) ?? (0 - 1)
+    let got = nodefmt.id_of(bytes) ?? 0 - 1
     if got < 0
         return fail(c, BadNode(page_id: page_id, cause: BadPageSize(got: list.len(bytes),
             want: nodefmt.page_size())))
@@ -484,7 +487,10 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
     let i = nodefmt.seek(leaf.keys, key)
     let found = i < list.len(leaf.keys) and leaf.keys[i] == key
     let n = list.len(leaf.keys)
-    let skip = if found then i + 1 else i
+    let skip = if found
+        i + 1
+    else
+        i
     let keys = list.concat(list.concat(list.slice(leaf.keys, 0, i), [key]), list.slice(leaf.keys, skip, n))
     let rows = list.concat(list.concat(list.slice(leaf.rows, 0, i), [list.clone(c.payload)]),
         list.slice(leaf.rows, skip, n))
@@ -492,7 +498,10 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
     var level = list.len(c.path) - 1
     var ids: [Int] = [c.path[level]]
     var firsts: [Int] = []
-    let leaves = if fits(keys, rows) then [Leaf { keys: keys, rows: rows }] else split_leaf(keys, rows)
+    let leaves = if fits(keys, rows)
+        [Leaf { keys: keys, rows: rows }]
+    else
+        split_leaf(keys, rows)
     for j in 0..list.len(leaves)
         if j > 0
             list.push(ids, alloc(plan, nodefmt.KIND_LEAF))
@@ -524,15 +533,18 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
         for j in 0..list.len(split.pieces)
             list.push(plan.writes, BtWrite { page_id: ids[j], node: BtInner(inner: split.pieces[j]) })
         firsts = split.promoted[:]
-    let grown = if found then 0 else 1
+    let grown = if found
+        0
+    else
+        1
     let next = Tree { root: root, size: c.tree.size + grown, height: height }
     start_plan(c, plan, next, 1)
 
-// The inner node at `level` on the path.
+// The inner node at `level` on the path.  Every level above the leaf
+// holds one.
 fn inner_at(c: Cursor, level: Int) -> nodefmt.Inner
-    match c.nodes[level]
-        BtInner(inner) => inner
-        BtLeaf(_)      => Inner { separators: [], children: [c.path[level]] }
+    let BtInner(inner) = c.nodes[level] else return Inner { separators: [], children: [] }
+    inner
 
 fn plan_delete(c: Cursor, leaf: nodefmt.Leaf) -> Progress
     let key = c.low
@@ -557,7 +569,10 @@ fn plan_delete(c: Cursor, leaf: nodefmt.Leaf) -> Progress
             let s = c.slots[level]
             let m = list.len(parent.children)
             let kids = list.concat(list.slice(parent.children, 0, s), list.slice(parent.children, s + 1, m))
-            let cut = if s > 0 then s - 1 else 0
+            let cut = if s > 0
+                s - 1
+            else
+                0
             let seps = list.concat(list.slice(parent.separators, 0, cut),
                 list.slice(parent.separators, cut + 1, list.len(parent.separators)))
             if list.len(kids) == 0
@@ -603,7 +618,8 @@ fn apply(c: Cursor) -> Progress
         var d = copy(c)
         d.writes = list.slice(c.writes, 1, list.len(c.writes))
         match encode(c.fresh, id, w.node)
-            Ok(bytes) => return out(d, SRequest(req: PrWritePage(page_id: id, bytes: bytes)))
+            Ok(bytes) =>
+                return out(d, SRequest(req: PrWritePage(page_id: id, bytes: bytes)))
             Err(e)    =>
                 let err = BadNode(page_id: id, cause: e)
                 return out(fail(d, err), SFailed(err: err))
@@ -644,8 +660,8 @@ pub enum BtreeError
 impl Error for BtreeError
     fn message(self) -> Str
         match self
-            BadNode(p, e)         => "btree: page ${p}: ${e.message()}"
-            Unexpected(f, w)      => "btree: fed ${f} while waiting for ${w}"
-            Cycle(p, d)           => "btree: page ${p} at depth ${d} closes a cycle"
-            RowTooLarge(k, n, h)  => "btree: the row at key ${k} needs ${n} bytes and a page holds ${h}"
-            Finished              => "btree: the cursor has finished"
+            BadNode(p, e)        => "btree: page ${p}: ${e.message()}"
+            Unexpected(f, w)     => "btree: fed ${f} while waiting for ${w}"
+            Cycle(p, d)          => "btree: page ${p} at depth ${d} closes a cycle"
+            RowTooLarge(k, n, h) => "btree: the row at key ${k} needs ${n} bytes and a page holds ${h}"
+            Finished             => "btree: the cursor has finished"

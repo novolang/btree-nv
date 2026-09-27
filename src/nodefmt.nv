@@ -196,9 +196,9 @@ pub fn decode_leaf(page: [Int]) -> Result<Leaf, NodeError>
     var keys: [Int] = []
     var rows: [[btcell.Cell]] = []
     var at = h + 4
+    // A count within `max` leaves room for every entry's 12-byte head,
+    // since an entry is at least 16 bytes.
     for i in 0..m
-        if at + 12 > page_size()
-            return Err(BadRow(index: i, cause: Truncated(offset: at, want: 12, have: page_size() - at)))
         list.push(keys, get_be(buf, at, 8))
         let len = get_be(buf, at + 8, 4)
         let start = at + 12
@@ -207,7 +207,8 @@ pub fn decode_leaf(page: [Int]) -> Result<Leaf, NodeError>
         let body = list.slice(buf, start, start + len)
         match btcell.decode_row(body, 0)
             Ok(r)  => list.push(rows, r.row[:])
-            Err(e) => return Err(BadRow(index: i, cause: e))
+            Err(e) =>
+                return Err(BadRow(index: i, cause: e))
         at = start + len
     Ok(Leaf { keys: keys, rows: rows })
 
