@@ -1,86 +1,60 @@
 // btree.nv — the tree as a state machine that asks for pages.
 //
-// THE LOAD-BEARING INTERFACE IS `PageRequest`
+// A lookup is a descent, and a descent needs the page under the cursor
+// before it can decide which page it wants next.  That read is the only
+// part of a tree that touches the machine, so it is the part this
+// module leaves to its caller.  Every operation is a `Cursor` the
+// caller advances with `step`, and a step is one of four things: a row
+// (`SRow`), the end of the operation (`SDone`), a page that did not
+// decode (`SFailed`), or a request (`SRequest`) the caller performs and
+// answers with `feed_page` or `feed_alloc` before stepping again.
 //
-// A B+-tree lookup is a descent, and a descent needs the page under
-// the cursor before it can decide which page to want next.  That read
-// is the only thing in a tree that touches the machine, so it is the
-// only thing this package refuses to do.  Every operation is a
-// `Cursor` the caller advances:
+// A cursor keeps the nodes on its path from the root, decoded, and the
+// entry or child it has reached in each.  A scan climbs back up that
+// path to the next child, so the leaves need no sibling links.  An
+// insert or a delete that reaches its leaf computes every page it will
+// change before it asks for anything: the pages to allocate, the pages
+// to write, and the pages to free.  A new page is named in the plan by
+// a negative number until its allocation is answered.  The requests
+// then go out in that order, allocations first, and the operation
+// finishes.
 //
-//     step(cursor) -> Progress { cursor, step }
-//
-// and `step` is one of four things.  `SRow` and `SDone` are answers.
-// `SFailed` is a page that did not decode.  `SRequest` is the tree
-// saying what it needs, and the caller performs it and hands the
-// result back through `feed_page` / `feed_alloc` before stepping
-// again.  Nothing in this module is charged an effect, and nothing in
-// it can be: it is `core`, its budget is `[]` (SPEC § "Package
-// layers"), and the compiler refuses a body that exceeds it.
-//
-// The loop a host writes is five lines, and `pageio.run` is that loop
-// written once for a host that would rather implement a trait — see
-// that module for the effect-polymorphic form, which costs the caller
-// exactly what its own `PageIo` impl costs and nothing more.
-//
-// WHERE THIS CAME FROM, AND WHERE IT DIVERGES
-//
-// novodb's `page_btree.nv` is the same tree over the same page format,
-// and its walkers are `lazy_btree_get`, `lazy_btree_size`,
-// `lazy_btree_scan_all` — each declared `[fs]`, each taking a
-// `PageSource` that resolves a page id by reading the file.  That is
-// the design this package inverts: the walk is the same, and the read
-// leaves with it.  Two consequences worth naming before anybody
-// implements a body:
-//
-//   * novodb's paged tree is READ-ONLY.  Writes go through a full
-//     rewrite in `pagefile.page_log_save`.  `PrWritePage`,
-//     `PrAllocPage` and `PrFreePage` below have no counterpart to port
-//     from; they are designed here.
-//   * novodb's in-memory tree is the one that inserts, and it
-//     path-copies rather than mutating, which is what gives its
-//     transaction layer snapshot isolation for free.  The paged
-//     insert has to buy that back with the pager's copy-on-write, and
-//     `PrAllocPage` is where it is bought.
+// An insert that makes a leaf hold more than `nodefmt.fanout()` keys
+// splits it, the left half keeping `nodefmt.split_at()` of them.  A
+// leaf whose rows no longer fit one page is split by size into as many
+// leaves as it takes.  A delete that empties a leaf frees it and
+// removes it from its parent, and a root left with one child gives way
+// to that child.  Nodes are not merged below half full; a lookup reads
+// the same number of pages either way.
 
 use btcell
 use nodefmt
 
 // What the tree needs the host to do before it can continue.
-//
-// This enum is the package's boundary, and `sql-engine-nv` and
-// `pager-nv` both name it rather than declaring one each — see the
-// README's "The load-bearing interface".  It lives HERE, in the lower
-// of the two `core` packages, because the tree is the thing that runs
-// out of pages: the SQL engine only relays what its cursors ask for,
-// and a type flowing downward through a relay belongs at the bottom.
 pub enum PageRequest
     // Read this page and give it back with `feed_page`.
     PrNeedPage(page_id: Int)
     // Store these `nodefmt.page_size()` bytes under this id.  The host
-    // may buffer them; the tree does not step again on the answer.
+    // may buffer them, and steps again without answering.
     PrWritePage(page_id: Int, bytes: [Int])
     // Allocate a fresh page of this kind and give its id back with
-    // `feed_alloc`.  The write path needs this and novodb has no
-    // counterpart to it — its paged form is read-only.
+    // `feed_alloc`.
     PrAllocPage(kind: Int)
-    // This page is no longer reachable.  Whether that means reuse now
-    // or reuse at the next commit is the pager's decision, not the
-    // tree's; novodb defers it under a snapshot pin and this package
-    // says nothing about which.
+    // This page is no longer reachable.  Whether it is reused now or at
+    // the next commit is the page store's decision.  The host steps
+    // again without answering.
     PrFreePage(page_id: Int)
 
 // A tree, named by the page its root lives on.
 //
-// `size` and `height` are the values the last completed operation
-// left; on a tree that was opened and not yet walked they are what
-// `open` was told.
+// `size` and `height` are what the last completed operation left, or
+// what `open` was told.
 pub struct Tree
     root: Int
     size: Int
     height: Int
 
-// What a cursor is doing, which is what decides how it answers a page.
+// What a cursor is doing.
 pub enum Op
     // Find one key.
     OpLookup
@@ -95,105 +69,157 @@ pub enum Op
 
 // One advance of a cursor.
 pub enum KeyedRow
-    // A row, and the key it was stored under.  Only `OpLookup`,
-    // `OpScanAll` and `OpRange` produce these.
+    // A row, and the key it was stored under.  A lookup, a scan and a
+    // range produce these.
     SRow(key: Int, row: [btcell.Cell])
     // The operation finished.  `rows_affected` is 1 for an insert, 1
-    // for a delete that found its key, 0 for a delete that did not,
-    // and the row count for a scan.
+    // for a delete that found its key and 0 for one that did not, and
+    // the row count for a lookup, a scan or a range.
     SDone(rows_affected: Int)
     // The tree needs something done before it can continue.
     SRequest(req: PageRequest)
-    // A page did not decode, or the tree's shape contradicted itself.
+    // A page did not decode, the host answered the wrong request, or
+    // the tree's shape contradicted itself.
     SFailed(err: BtreeError)
 
 // A cursor and the step it just took.
-//
-// The cursor comes back rather than being mutated because nothing in
-// this package mutates: SPEC § 14's `@value` shape is what lets a
-// caller hold two cursors over one tree and know they cannot alias.
 pub struct Progress
     cursor: Cursor
     step: KeyedRow
 
+// One node on a cursor's path, decoded.
+pub enum BtNode
+    BtLeaf(leaf: nodefmt.Leaf)
+    BtInner(inner: nodefmt.Inner)
+
+// One page an insert or a delete will write.  A negative `page_id`
+// names a page still to be allocated: -1 is the first allocation of
+// the plan, -2 the second.  An inner node's children are named the
+// same way.
+pub struct BtWrite
+    page_id: Int
+    node: BtNode
+
 // A position in a walk, and everything the walk still needs to know.
 //
-// The fields are the state machine's own and are NOT a stable surface
-// below 1.0 — a consumer reads `Progress.step` and calls the functions
-// below.  They are declared rather than hidden because a reviewer of
-// an interface is reviewing exactly this: the claim that a descent
-// needs a path, a slot per level, and one page in hand, and nothing
-// else that a host would have to keep for it.
+// The fields are the state machine's own and may change in a minor
+// release below 1.0.  A caller reads `Progress.step` and calls the
+// functions below.
 pub struct Cursor
     // The tree being walked.
-    tree: Tree
+    var tree: Tree
     // What this cursor is doing.
     op: Op
-    // The key bounds.  `OpLookup`, `OpInsert` and `OpDelete` set both
-    // to the one key; `OpScanAll` sets the full range.
+    // The key bounds, inclusive.  A lookup, an insert and a delete set
+    // both to their key; a scan sets the whole range of `Int`.
     low: Int
     high: Int
-    // The row an insert is carrying, empty for every other op.
+    // The row an insert carries; empty for every other operation.
     payload: [btcell.Cell]
     // Page ids from the root down to the page under the cursor.
-    path: [Int]
-    // The entry index reached within each page on `path`.
-    slots: [Int]
-    // The page id the cursor last asked for and has not been fed, or 0
-    // when it is not waiting on one.
-    awaiting_page: Int
-    // Rows emitted or rows changed so far.
-    affected: Int
-    // Set once the walk has failed; every later `step` repeats it.
-    failed: ?BtreeError
+    var path: [Int]
+    // The nodes on `path`, decoded.
+    var nodes: [BtNode]
+    // The child reached in each inner node on `path`, and the next
+    // entry in the leaf.
+    var slots: [Int]
+    // True once the root has been asked for.
+    var started: Bool
+    // The page the cursor asked for and has not been fed, or 0.
+    var awaiting_page: Int
+    // Rows emitted or changed so far.
+    var affected: Int
+    // True while an insert or a delete sends out its plan.
+    var applying: Bool
+    // The page kinds the plan allocates, in order, and the ids fed for
+    // them so far.
+    var allocs: [Int]
+    var fresh: [Int]
+    // The pages still to write and to free.
+    var writes: [BtWrite]
+    var frees: [Int]
+    // The tree as it will be when the plan is done.
+    var next: Tree
+    // Set once the walk has finished or failed; every later step
+    // answers it.
+    var failed: ?BtreeError
 
 // A tree rooted at this page.
 //
-// `size` and `height` are what the caller already knows — a pager
-// reads them from the file header — and nothing verifies them; they
-// are what `Tree` answers until a walk corrects it.
+// `size` and `height` are what the caller already knows, as a page
+// store reads them from its file header.  Nothing checks them.  Page
+// id 0 is not a page.
 pub fn open(root_page_id: Int, size: Int, height: Int) -> Tree
-    todo("btree-nv.btree.open")
+    Tree { root: root_page_id, size: size, height: height }
 
-// The request that starts an empty tree: one page to be its root.
+// The request that starts an empty tree: one leaf page to be its root.
 //
-// A tree with no root is not a `Tree`, so this returns the request
-// rather than a tree — the caller performs it and passes the id it
-// gets back to `open`.
+// The caller performs it, writes an empty leaf there (its 16-byte
+// header is enough), and passes the id to `open`.
 pub fn create() -> PageRequest
-    todo("btree-nv.btree.create")
+    PrAllocPage(kind: nodefmt.KIND_LEAF)
 
-// A cursor that will produce the row at `key`, or `SDone(0)`.
+fn cursor(t: Tree, op: Op, low: Int, high: Int, payload: [btcell.Cell]) -> Cursor
+    Cursor { tree: t, op: op, low: low, high: high, payload: list.clone(payload), path: [],
+        nodes: [], slots: [], started: false, awaiting_page: 0, affected: 0, applying: false,
+        allocs: [], fresh: [], writes: [], frees: [], next: t, failed: None }
+
+// A cursor that will produce the row at `key` and then `SDone(1)`, or
+// `SDone(0)` when the key is not there.
 pub fn lookup(t: Tree, key: Int) -> Cursor
-    todo("btree-nv.btree.lookup")
+    cursor(t, OpLookup, key, key, [])
 
 // A cursor that will produce every row in key order.
 pub fn scan(t: Tree) -> Cursor
-    todo("btree-nv.btree.scan")
+    cursor(t, OpScanAll, 0 - 9223372036854775807 - 1, 9223372036854775807, [])
 
 // A cursor that will produce every row whose key is in `[low, high]`,
 // in key order, both bounds inclusive.
 pub fn range(t: Tree, low: Int, high: Int) -> Cursor
-    todo("btree-nv.btree.range")
+    cursor(t, OpRange, low, high, [])
 
 // A cursor that will store `row` under `key`, replacing whatever was
 // there.
 //
-// The walk emits `PrWritePage` for the leaf, and — when the leaf split
-// — a `PrAllocPage` and a `PrWritePage` for each new node up to and
-// including a new root.  `tree_of` on the finished cursor is the tree
-// to keep: a split changes the root.
+// After the descent it asks for each page a split needs, then writes
+// every changed node from the leaf up, a new root last.  `tree_of` on
+// the finished cursor is the tree to keep, because a split of the root
+// moves it.  A row that cannot fit a page even alone fails the cursor
+// with `RowTooLarge`.
 pub fn insert(t: Tree, key: Int, row: [btcell.Cell]) -> Cursor
-    todo("btree-nv.btree.insert")
+    cursor(t, OpInsert, key, key, row)
 
 // A cursor that will remove the row at `key`.
 //
 // Finishes `SDone(0)` when the key was not there, which is not an
-// error.
+// error, and writes nothing.
 pub fn delete(t: Tree, key: Int) -> Cursor
-    todo("btree-nv.btree.delete")
+    cursor(t, OpDelete, key, key, [])
+
+// ── stepping ─────────────────────────────────────────────────────────
+
+// A new cursor with the same state, for a function to change.
+fn copy(c: Cursor) -> Cursor
+    Cursor { tree: c.tree, op: c.op, low: c.low, high: c.high, payload: c.payload,
+        path: c.path[:], nodes: c.nodes[:], slots: c.slots[:], started: c.started,
+        awaiting_page: c.awaiting_page, affected: c.affected, applying: c.applying,
+        allocs: c.allocs[:], fresh: c.fresh[:], writes: c.writes[:], frees: c.frees[:],
+        next: c.next, failed: c.failed }
+
+fn out(c: Cursor, s: KeyedRow) -> Progress
+    Progress { cursor: c, step: s }
+
+// The cursor with its walk ended by `e`.
+fn fail(c: Cursor, e: BtreeError) -> Cursor
+    var d = copy(c)
+    d.failed = Some(e)
+    d
 
 // Advance the cursor once.
+//
+// Stepping a cursor that waits for a page or an allocation asks for it
+// again.  A finished cursor answers `SFailed(Finished)`, and a failed
+// one repeats its failure.
 //
 // ```novo
 // use btree
@@ -213,52 +239,413 @@ pub fn delete(t: Tree, key: Int) -> Cursor
 //     n
 // ```
 pub fn step(c: Cursor) -> Progress
-    todo("btree-nv.btree.step")
+    if let Some(e) = c.failed
+        return out(c, SFailed(err: e))
+    if c.awaiting_page != 0
+        return out(c, SRequest(req: PrNeedPage(page_id: c.awaiting_page)))
+    if c.applying
+        return apply(c)
+    walk(c)
+
+// Ask for a page and wait for it.
+fn request(c: Cursor, page_id: Int) -> Progress
+    var d = copy(c)
+    d.awaiting_page = page_id
+    d.started = true
+    out(d, SRequest(req: PrNeedPage(page_id: page_id)))
+
+// Finish the walk with `SDone`.
+fn finish(c: Cursor) -> Progress
+    var d = copy(c)
+    d.failed = Some(Finished)
+    out(d, SDone(rows_affected: c.affected))
+
+// Walk the path until something is answered.
+fn walk(c0: Cursor) -> Progress
+    var c = c0
+    loop
+        let depth = list.len(c.path)
+        if depth == 0
+            if c.started
+                return finish(done_scan(c))
+            return request(c, c.tree.root)
+        let top = c.nodes[depth - 1]
+        let slot = c.slots[depth - 1]
+        match top
+            BtInner(inner) =>
+                if slot < list.len(inner.children)
+                    return request(c, inner.children[slot])
+                c = pop(c)
+            BtLeaf(leaf)   =>
+                match c.op
+                    OpLookup  => return at_lookup(c, leaf)
+                    OpInsert  => return plan_insert(c, leaf)
+                    OpDelete  => return plan_delete(c, leaf)
+                    _         =>
+                        if slot < list.len(leaf.keys)
+                            return at_scan(c, leaf, slot)
+                        c = pop(c)
+
+// A finished scan knows the size of what it scanned.
+fn done_scan(c: Cursor) -> Cursor
+    if c.op != OpScanAll
+        return c
+    var d = copy(c)
+    d.tree = Tree { root: c.tree.root, size: c.affected, height: c.tree.height }
+    d
+
+// Leave the page on top of the path, and move the parent to its next
+// child.
+fn pop(c: Cursor) -> Cursor
+    let n = list.len(c.path)
+    var d = copy(c)
+    d.path = list.slice(c.path, 0, n - 1)
+    d.nodes = list.slice(c.nodes, 0, n - 1)
+    var slots = list.slice(c.slots, 0, n - 1)
+    if n > 1
+        slots[n - 2] = slots[n - 2] + 1
+    d.slots = slots
+    d
+
+fn at_lookup(c: Cursor, leaf: nodefmt.Leaf) -> Progress
+    let i = nodefmt.seek(leaf.keys, c.low)
+    let found = i < list.len(leaf.keys) and leaf.keys[i] == c.low
+    if found and c.affected == 0
+        var d = copy(c)
+        d.affected = 1
+        return out(d, SRow(key: c.low, row: leaf.rows[i][:]))
+    finish(c)
+
+fn at_scan(c: Cursor, leaf: nodefmt.Leaf, slot: Int) -> Progress
+    let k = leaf.keys[slot]
+    if k > c.high
+        return finish(c)
+    var d = copy(c)
+    var slots = list.clone(c.slots)
+    slots[list.len(slots) - 1] = slot + 1
+    d.slots = slots
+    d.affected = c.affected + 1
+    out(d, SRow(key: k, row: leaf.rows[slot][:]))
+
+// ── feeding ──────────────────────────────────────────────────────────
 
 // Hand back the page the cursor asked for.
 //
-// `bytes` is a whole page, `nodefmt.page_size()` long, header
-// included; the header's id is checked against the id that was asked
-// for, and a disagreement finishes the cursor with `IdMismatch`.
+// `bytes` is the whole page, header included, at most
+// `nodefmt.page_size()` long; a shorter page reads as zero-padded.  A
+// page the cursor did not ask for fails it with `Unexpected`, a header
+// whose id is not `page_id` with `BadNode` and `IdMismatch`, and a
+// page already on the path, or a path deeper than 64 pages, with
+// `Cycle`.
 pub fn feed_page(c: Cursor, page_id: Int, bytes: [Int]) -> Cursor
-    todo("btree-nv.btree.feed_page")
+    if c.failed != None
+        return c
+    if c.awaiting_page == 0 or page_id != c.awaiting_page
+        return fail(c, Unexpected(fed: page_id, wanted: c.awaiting_page))
+    let got = nodefmt.id_of(bytes) ?? (0 - 1)
+    if got < 0
+        return fail(c, BadNode(page_id: page_id, cause: BadPageSize(got: list.len(bytes),
+            want: nodefmt.page_size())))
+    if got != page_id
+        return fail(c, BadNode(page_id: page_id, cause: IdMismatch(got: got, want: page_id)))
+    let depth = list.len(c.path) + 1
+    if list.contains(c.path, page_id) or depth > 64
+        return fail(c, Cycle(page_id: page_id, depth: depth))
+    match decode(bytes)
+        Ok(node) => push(c, page_id, node)
+        Err(e)   => fail(c, BadNode(page_id: page_id, cause: e))
+
+// A page as the node its kind byte names.
+fn decode(bytes: [Int]) -> Result<BtNode, NodeError>
+    if nodefmt.kind_of(bytes) == Some(nodefmt.KIND_INNER)
+        return Ok(BtInner(inner: nodefmt.decode_inner(bytes)!))
+    Ok(BtLeaf(leaf: nodefmt.decode_leaf(bytes)!))
+
+// Put a fed node on top of the path, at the child or entry the
+// cursor's low bound reaches.
+fn push(c: Cursor, page_id: Int, node: BtNode) -> Cursor
+    let slot = match node
+        BtInner(inner) => nodefmt.child_for(inner, c.low)
+        BtLeaf(leaf)   => nodefmt.seek(leaf.keys, c.low)
+    var d = copy(c)
+    d.awaiting_page = 0
+    d.path = list.concat(c.path, [page_id])
+    d.nodes = list.concat(c.nodes, [node])
+    d.slots = list.concat(c.slots, [slot])
+    d.tree = Tree { root: c.tree.root, size: c.tree.size, height: c.tree.height }
+    d
 
 // Hand back the id of a page the cursor asked to have allocated.
+//
+// An id the cursor did not ask for fails it with `Unexpected`, naming
+// 0 as the page wanted.
 pub fn feed_alloc(c: Cursor, page_id: Int) -> Cursor
-    todo("btree-nv.btree.feed_alloc")
+    if c.failed != None
+        return c
+    if not c.applying or list.len(c.fresh) >= list.len(c.allocs)
+        return fail(c, Unexpected(fed: page_id, wanted: 0))
+    var d = copy(c)
+    d.fresh = list.concat(c.fresh, [page_id])
+    d
 
 // The page id the cursor is waiting for, or `None` when it is not
-// waiting.
-//
-// A host that drives several cursors at once uses this to batch reads;
-// one that drives them one at a time never needs it.
+// waiting for a page.
 pub fn awaiting(c: Cursor) -> ?Int
-    todo("btree-nv.btree.awaiting")
+    if c.awaiting_page == 0
+        return None
+    Some(c.awaiting_page)
 
 // The tree as the cursor now understands it.
 //
-// After an insert that split the root this is the tree to keep: the
-// root moved, and the caller has to store the new id somewhere the
-// next `open` will read it.
+// After an insert that split the root, this is the tree to keep: the
+// root moved.
 pub fn tree_of(c: Cursor) -> Tree
-    todo("btree-nv.btree.tree_of")
+    c.tree
+
+// ── the write plan ───────────────────────────────────────────────────
+
+// An entry's bytes in a leaf: key, length, row.
+fn entry_size(row: [btcell.Cell]) -> Int
+    12 + btcell.encoded_row_size(row)
+
+// Whether a leaf holding these rows fits one page and the key limit.
+fn fits(keys: [Int], rows: [[btcell.Cell]]) -> Bool
+    list.len(keys) <= nodefmt.fanout()
+        and nodefmt.leaf_encoded_size(Leaf { keys: keys, rows: rows }) <= nodefmt.payload_size()
+
+// The leaves a too-full leaf becomes.  A leaf one key over the limit
+// splits at `split_at` when both halves fit; otherwise it is packed
+// greedily, each piece taking entries until the next would not fit.
+fn split_leaf(keys: [Int], rows: [[btcell.Cell]]) -> [nodefmt.Leaf]
+    let n = list.len(keys)
+    let h = nodefmt.split_at()
+    let lk = list.slice(keys, 0, h)
+    let lr = list.slice(rows, 0, h)
+    let rk = list.slice(keys, h, n)
+    let rr = list.slice(rows, h, n)
+    if n == nodefmt.fanout() + 1 and fits(lk, lr) and fits(rk, rr)
+        return [Leaf { keys: lk, rows: lr }, Leaf { keys: rk, rows: rr }]
+    var pieces: [nodefmt.Leaf] = []
+    var start = 0
+    var size = 4
+    for i in 0..n
+        let e = entry_size(rows[i])
+        if i > start and (size + e > nodefmt.payload_size() or i - start == nodefmt.fanout())
+            list.push(pieces, Leaf { keys: list.slice(keys, start, i),
+                rows: list.slice(rows, start, i) })
+            start = i
+            size = 4
+        size = size + e
+    list.push(pieces, Leaf { keys: list.slice(keys, start, n),
+        rows: list.slice(rows, start, n) })
+    pieces
+
+// The inner nodes a too-full inner node becomes, and the separators
+// promoted between them.  Each piece but the last takes `split_at`
+// separators, and the separator after it moves up.
+struct PbInnerSplit
+    var pieces: [nodefmt.Inner]
+    var promoted: [Int]
+
+fn split_inner(seps: [Int], kids: [Int]) -> PbInnerSplit
+    var pieces: [nodefmt.Inner] = []
+    var promoted: [Int] = []
+    var s = list.clone(seps)
+    var k = list.clone(kids)
+    let h = nodefmt.split_at()
+    loop
+        if list.len(s) <= nodefmt.fanout()
+            break
+        list.push(pieces, Inner { separators: list.slice(s, 0, h),
+            children: list.slice(k, 0, h + 1) })
+        list.push(promoted, s[h])
+        s = list.slice(s, h + 1, list.len(s))
+        k = list.slice(k, h + 1, list.len(k))
+    list.push(pieces, Inner { separators: s, children: k })
+    PbInnerSplit { pieces: pieces, promoted: promoted }
+
+// What a plan has gathered while it climbs the path.
+struct PbPlan
+    var allocs: [Int]
+    var writes: [BtWrite]
+    var frees: [Int]
+
+// Name the next page to allocate: -1, -2, and so on.
+fn alloc(var p: PbPlan, kind: Int) -> Int
+    list.push(p.allocs, kind)
+    0 - list.len(p.allocs)
+
+fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
+    let key = c.low
+    let need = 4 + entry_size(c.payload)
+    if need > nodefmt.payload_size()
+        return out(fail(c, RowTooLarge(key: key, need: need, have: nodefmt.payload_size())),
+            SFailed(err: RowTooLarge(key: key, need: need, have: nodefmt.payload_size())))
+    let i = nodefmt.seek(leaf.keys, key)
+    let found = i < list.len(leaf.keys) and leaf.keys[i] == key
+    let n = list.len(leaf.keys)
+    let skip = if found then i + 1 else i
+    let keys = list.concat(list.concat(list.slice(leaf.keys, 0, i), [key]), list.slice(leaf.keys, skip, n))
+    let rows = list.concat(list.concat(list.slice(leaf.rows, 0, i), [list.clone(c.payload)]),
+        list.slice(leaf.rows, skip, n))
+    var plan = PbPlan { allocs: [], writes: [], frees: [] }
+    var level = list.len(c.path) - 1
+    var ids: [Int] = [c.path[level]]
+    var firsts: [Int] = []
+    let leaves = if fits(keys, rows) then [Leaf { keys: keys, rows: rows }] else split_leaf(keys, rows)
+    for j in 0..list.len(leaves)
+        if j > 0
+            list.push(ids, alloc(plan, nodefmt.KIND_LEAF))
+            list.push(firsts, leaves[j].keys[0])
+        list.push(plan.writes, BtWrite { page_id: ids[j], node: BtLeaf(leaf: leaves[j]) })
+    var root = c.tree.root
+    var height = list.len(c.path)
+    loop
+        if list.len(ids) == 1
+            break
+        if level == 0
+            let top = alloc(plan, nodefmt.KIND_INNER)
+            list.push(plan.writes, BtWrite { page_id: top,
+                node: BtInner(inner: Inner { separators: firsts, children: ids }) })
+            root = top
+            height = height + 1
+            break
+        level = level - 1
+        let parent = inner_at(c, level)
+        let s = c.slots[level]
+        let kids = list.concat(list.concat(list.slice(parent.children, 0, s), ids),
+            list.slice(parent.children, s + 1, list.len(parent.children)))
+        let seps = list.concat(list.concat(list.slice(parent.separators, 0, s), firsts),
+            list.slice(parent.separators, s, list.len(parent.separators)))
+        let split = split_inner(seps, kids)
+        ids = [c.path[level]]
+        for j in 1..list.len(split.pieces)
+            list.push(ids, alloc(plan, nodefmt.KIND_INNER))
+        for j in 0..list.len(split.pieces)
+            list.push(plan.writes, BtWrite { page_id: ids[j], node: BtInner(inner: split.pieces[j]) })
+        firsts = split.promoted[:]
+    let grown = if found then 0 else 1
+    let next = Tree { root: root, size: c.tree.size + grown, height: height }
+    start_plan(c, plan, next, 1)
+
+// The inner node at `level` on the path.
+fn inner_at(c: Cursor, level: Int) -> nodefmt.Inner
+    match c.nodes[level]
+        BtInner(inner) => inner
+        BtLeaf(_)      => Inner { separators: [], children: [c.path[level]] }
+
+fn plan_delete(c: Cursor, leaf: nodefmt.Leaf) -> Progress
+    let key = c.low
+    let i = nodefmt.seek(leaf.keys, key)
+    if i >= list.len(leaf.keys) or leaf.keys[i] != key
+        return finish(c)
+    let n = list.len(leaf.keys)
+    let keys = list.concat(list.slice(leaf.keys, 0, i), list.slice(leaf.keys, i + 1, n))
+    let rows = list.concat(list.slice(leaf.rows, 0, i), list.slice(leaf.rows, i + 1, n))
+    var plan = PbPlan { allocs: [], writes: [], frees: [] }
+    var level = list.len(c.path) - 1
+    var root = c.tree.root
+    var height = list.len(c.path)
+    if list.len(keys) > 0 or level == 0
+        list.push(plan.writes, BtWrite { page_id: c.path[level],
+            node: BtLeaf(leaf: Leaf { keys: keys, rows: rows }) })
+    else
+        list.push(plan.frees, c.path[level])
+        loop
+            level = level - 1
+            let parent = inner_at(c, level)
+            let s = c.slots[level]
+            let m = list.len(parent.children)
+            let kids = list.concat(list.slice(parent.children, 0, s), list.slice(parent.children, s + 1, m))
+            let cut = if s > 0 then s - 1 else 0
+            let seps = list.concat(list.slice(parent.separators, 0, cut),
+                list.slice(parent.separators, cut + 1, list.len(parent.separators)))
+            if list.len(kids) == 0
+                list.push(plan.frees, c.path[level])
+            else if level == 0 and list.len(kids) == 1
+                list.push(plan.frees, c.path[level])
+                root = kids[0]
+                height = height - 1
+                break
+            else
+                list.push(plan.writes, BtWrite { page_id: c.path[level],
+                    node: BtInner(inner: Inner { separators: seps, children: kids }) })
+                break
+    let next = Tree { root: root, size: c.tree.size - 1, height: height }
+    start_plan(c, plan, next, 1)
+
+// Hand the plan to the cursor and send its first request.
+fn start_plan(c: Cursor, var plan: PbPlan, next: Tree, affected: Int) -> Progress
+    var d = copy(c)
+    d.applying = true
+    d.allocs = plan.allocs
+    d.writes = plan.writes
+    d.frees = plan.frees
+    d.next = next
+    d.affected = affected
+    apply(d)
+
+// The real id a plan's page id names.
+fn resolve(fresh: [Int], id: Int) -> Int
+    if id >= 0
+        return id
+    fresh[0 - id - 1]
+
+// Send the plan's next request: an allocation, a write, a free, and
+// then the end.
+fn apply(c: Cursor) -> Progress
+    let k = list.len(c.fresh)
+    if k < list.len(c.allocs)
+        return out(c, SRequest(req: PrAllocPage(kind: c.allocs[k])))
+    if list.len(c.writes) > 0
+        let w = c.writes[0]
+        let id = resolve(c.fresh, w.page_id)
+        var d = copy(c)
+        d.writes = list.slice(c.writes, 1, list.len(c.writes))
+        match encode(c.fresh, id, w.node)
+            Ok(bytes) => return out(d, SRequest(req: PrWritePage(page_id: id, bytes: bytes)))
+            Err(e)    =>
+                let err = BadNode(page_id: id, cause: e)
+                return out(fail(d, err), SFailed(err: err))
+    if list.len(c.frees) > 0
+        var d = copy(c)
+        d.frees = list.slice(c.frees, 1, list.len(c.frees))
+        return out(d, SRequest(req: PrFreePage(page_id: c.frees[0])))
+    var d = copy(c)
+    d.tree = Tree { root: resolve(c.fresh, c.next.root), size: c.next.size, height: c.next.height }
+    finish(d)
+
+// A planned node as page bytes, its children's ids resolved.
+fn encode(fresh: [Int], id: Int, node: BtNode) -> Result<[Int], NodeError>
+    match node
+        BtLeaf(leaf)   => nodefmt.encode_leaf(id, leaf)
+        BtInner(inner) =>
+            var kids: [Int] = []
+            for k in inner.children
+                list.push(kids, resolve(fresh, k))
+            nodefmt.encode_inner(id, Inner { separators: inner.separators, children: kids })
 
 // Why a walk stopped.
 pub enum BtreeError
-    // A page did not decode as the node the descent expected.
+    // A page did not decode as a node.
     BadNode(page_id: Int, cause: nodefmt.NodeError)
-    // The host fed a page the cursor had not asked for.
+    // The host fed a page, or an allocation, the cursor had not asked
+    // for.  `wanted` is the page it was waiting for, or 0.
     Unexpected(fed: Int, wanted: Int)
-    // The descent went deeper than a tree of this size can be, which
-    // means the child pointers form a cycle.
+    // A page appeared twice on one path, or the path passed 64 pages,
+    // which means the child pointers form a cycle.
     Cycle(page_id: Int, depth: Int)
-    // A row did not fit a page even alone on it.  The overflow-page
-    // chain that would fix this is not in this version.
+    // A row does not fit a page even alone on it.
     RowTooLarge(key: Int, need: Int, have: Int)
-    // A cursor was stepped after it had finished.
+    // The cursor was stepped after it had finished.
     Finished
 
-// The human sentence behind each way a walk can stop.
+// The one-line report of a walk that stopped.
 impl Error for BtreeError
     fn message(self) -> Str
-        todo("btree-nv.btree.BtreeError.message")
+        match self
+            BadNode(p, e)         => "btree: page ${p}: ${e.message()}"
+            Unexpected(f, w)      => "btree: fed ${f} while waiting for ${w}"
+            Cycle(p, d)           => "btree: page ${p} at depth ${d} closes a cycle"
+            RowTooLarge(k, n, h)  => "btree: the row at key ${k} needs ${n} bytes and a page holds ${h}"
+            Finished              => "btree: the cursor has finished"

@@ -1,96 +1,71 @@
-// nodefmt.nv — one B+-tree node, one page, and the bytes between them.
+// nodefmt.nv — one B+ tree node, one page, and the bytes between them.
 //
-// The tree is a B+ tree keyed by `Int`: every key and every row lives
-// in a leaf, and an inner node holds only separators and child page
-// ids.  One node occupies one page, which is what makes a traversal
-// cost O(depth) pages rather than the whole table — novodb measured
-// that as 95 GB of resident memory down to a few pages on a 30 M-row
-// scan, and it is the reason the paged form exists beside the
-// in-memory one at all.
+// The tree is keyed by `Int`.  Every key and every row lives in a
+// leaf, and an inner node holds only separators and child page ids.
+// One node occupies one page, so a descent reads as many pages as the
+// tree is deep.
 //
-// PAGE LAYOUT — the 16-byte header, then the payload
+// A page is a 16-byte header and then the payload:
 //
-//   byte  0        page kind (see `KIND_LEAF` / `KIND_INNER`)
+//   byte  0        page kind (`KIND_LEAF` or `KIND_INNER`)
 //   bytes 1..3     reserved, zero
 //   bytes 4..7     page id, big-endian u32
 //   bytes 8..15    reserved, zero
 //   bytes 16..     payload, `payload_size()` bytes
 //
-// LEAF PAYLOAD
+// A leaf payload is an entry count M (big-endian u32) and M entries,
+// each an 8-byte big-endian key, a 4-byte big-endian row length L, and
+// the L bytes `btcell.encode_row` wrote.  An inner payload is a child
+// count K (big-endian u32), K child page ids of 4 bytes each, and K-1
+// separator keys of 8 bytes each.  Zero padding fills both to the end
+// of the page.
 //
-//   bytes 0..3     entry count M, big-endian u32
-//   then M entries, each:
-//     bytes 0..7   key, big-endian i64
-//     bytes 8..11  encoded row length L, big-endian u32
-//     bytes 12..   L bytes, as `btcell.encode_row` wrote them
-//   zero padding to the end of the payload
+// A page shorter than `page_size()` reads as though it were padded
+// with zeros, so the 16-byte header of a leaf page is a leaf with no
+// entries.  A page longer than `page_size()` is refused.
 //
-// INNER PAYLOAD
-//
-//   bytes 0..3     child count K, big-endian u32
-//   next K*4       K child page ids, big-endian u32 each
-//   next (K-1)*8   K-1 separator keys, big-endian i64 each
-//   zero padding to the end of the payload
-//
-// Every field is big-endian, which is the one endianness the whole
-// format uses, on disk and in the checksums pager-nv computes over it.
-//
-// WHAT THIS MODULE IS NOT
-//
-// It performs nothing.  Every function here takes bytes the caller
-// already holds and returns bytes the caller will store.  A node is
-// fetched by `btree.step` asking for it — see `btree.PageRequest`.
+// Every function here takes bytes the caller holds and answers bytes
+// the caller will store.  Nothing is read or written.
 
 use btcell
 
 // The page kind in byte 0 of a leaf page.
 //
-// The numbers continue novodb's page-type range (1 root, 2 internal,
-// 3 leaf, 4 freelist, 5 overflow), so a pager-nv image can carry both
-// this package's nodes and the pager's own bookkeeping pages without
-// a second tag space.
+// 1 to 5 are the page kinds of the page store underneath (root,
+// internal, leaf, free list, overflow), so a node takes 6 and 7 and
+// one tag space serves both.
 pub const KIND_LEAF: Int = 6
 
 // The page kind in byte 0 of an inner page.
 pub const KIND_INNER: Int = 7
 
-// The page size this package's node format is written for.
+// The page size this node format is written for: 4096 bytes.
 //
-// 4096 bytes, which is the page size of every filesystem the pager
-// runs on and of SQLite's own default.  It is a function rather than
-// a constant in a signature because a later version means to take it
-// from the file header instead, and a call site that already reads it
-// as a value does not change when it does.
+// It is a function rather than a constant so that a later version can
+// take it from a file header without any call site changing.
 pub fn page_size() -> Int
-    todo("btree-nv.nodefmt.page_size")
+    4096
 
-// The 16-byte page header's size.
+// The size of the page header: 16 bytes.
 pub fn header_size() -> Int
-    todo("btree-nv.nodefmt.header_size")
+    16
 
 // How many payload bytes a page holds: `page_size() - header_size()`.
 pub fn payload_size() -> Int
-    todo("btree-nv.nodefmt.payload_size")
+    page_size() - header_size()
 
-// The maximum number of keys a node holds before it splits.
-//
-// 16, which novodb measured rather than guessed: over M in {4, 8, 16,
-// 32} on its 1000-row benchmark, every read path roughly halved from
-// M=4 to M=16 while insert stayed inside noise, and M=32 started
-// costing inserts because the in-node linear shuffle dominates.
+// The most keys a node holds before it splits: 16.
 pub fn fanout() -> Int
-    todo("btree-nv.nodefmt.fanout")
+    16
 
-// The left half's size when a node that reached `fanout() + 1` keys
-// splits — `fanout() / 2`, and the B+-tree invariant is that it stays
-// equal to it.
+// The size of the left half when a node that reached `fanout() + 1`
+// keys splits: `fanout() / 2`.
 pub fn split_at() -> Int
-    todo("btree-nv.nodefmt.split_at")
+    fanout() / 2
 
 // A leaf node, decoded: keys ascending, and the row for each.
 //
-// The two lists run parallel and are the same length; `keys[i]` is the
-// key of `rows[i]`.
+// The two lists run parallel; `keys[i]` is the key of `rows[i]`.
 pub struct Leaf
     keys: [Int]
     rows: [[btcell.Cell]]
@@ -98,96 +73,222 @@ pub struct Leaf
 // An inner node, decoded: child page ids, and the separators between
 // them.
 //
-// `children` is one longer than `separators`, which is the B+-tree
-// shape: a key `k` descends into `children[i]` where `i` is the count
-// of separators `<= k`.
+// `children` is one longer than `separators`.  A key `k` descends into
+// `children[i]` where `i` is the count of separators `<= k`, so
+// `separators[i]` is the smallest key under `children[i + 1]`.
 pub struct Inner
     separators: [Int]
     children: [Int]
 
+// Append `n` bytes of `v`, big-endian.
+fn put_be(var out: [Int], v: Int, n: Int)
+    for i in 0..n
+        list.push(out, (v >>> (8 * (n - 1 - i))) & 0xff)
+
+// The byte at `i`, or 0 past the end: a short page reads as padded.
+fn byte(page: [Int], i: Int) -> Int
+    if i >= list.len(page)
+        return 0
+    page[i] & 0xff
+
+// `n` big-endian bytes at `i`, the bytes past the end read as zero.
+fn get_be(page: [Int], i: Int, n: Int) -> Int
+    var v = 0
+    for k in 0..n
+        v = (v << 8) | byte(page, i + k)
+    v
+
 // Write the 16-byte page header for a page of this kind and id.
 //
-// Returns exactly `header_size()` bytes; the payload follows.
+// Answers exactly `header_size()` bytes; the payload follows.
 pub fn encode_header(kind: Int, page_id: Int) -> [Int]
-    todo("btree-nv.nodefmt.encode_header")
+    var out: [Int] = [kind & 0xff, 0, 0, 0]
+    put_be(out, page_id, 4)
+    for i in 0..8
+        list.push(out, 0)
+    out
 
-// The page kind byte 0 of `page` names, or `None` when the page is
-// shorter than a header.
+// The page kind byte 0 names, or `None` when the page is shorter than
+// a header.
 pub fn kind_of(page: [Int]) -> ?Int
-    todo("btree-nv.nodefmt.kind_of")
+    if list.len(page) < header_size()
+        return None
+    Some(page[0])
 
-// The page id bytes 4..7 of `page` name, or `None` when the page is
-// shorter than a header.
+// The page id bytes 4 to 7 name, or `None` when the page is shorter
+// than a header.
 //
-// A pager hands a page back keyed by the id it was asked for; this is
-// what lets the tree check that the bytes agree, which is the cheapest
-// detector there is for a mis-seeked read.
+// The tree checks it against the id a page was fetched under, which is
+// the cheapest detector for a read that went to the wrong offset.
 pub fn id_of(page: [Int]) -> ?Int
-    todo("btree-nv.nodefmt.id_of")
+    if list.len(page) < header_size()
+        return None
+    Some(get_be(page, 4, 4))
 
-// Encode a leaf node as a whole page — header, entries, zero padding.
+// Zero bytes from the end of `out` to a whole page.
+fn pad(var out: [Int])
+    for i in list.len(out)..page_size()
+        list.push(out, 0)
+
+// Encode a leaf node as a whole page: header, entries, zero padding.
 //
-// Fails with `Overflow` when the rows do not fit `payload_size()`;
-// splitting is `btree`'s decision, not this module's, so the encoder
-// reports rather than splits.
+// `Overflow` when the entries do not fit `payload_size()`.  Splitting
+// is the tree's decision, so the encoder reports rather than splits.
 pub fn encode_leaf(page_id: Int, node: Leaf) -> Result<[Int], NodeError>
-    todo("btree-nv.nodefmt.encode_leaf")
+    let need = leaf_encoded_size(node)
+    if need > payload_size()
+        return Err(Overflow(need: need, have: payload_size()))
+    var out = encode_header(KIND_LEAF, page_id)
+    put_be(out, list.len(node.keys), 4)
+    for i in 0..list.len(node.keys)
+        put_be(out, node.keys[i], 8)
+        put_be(out, btcell.encoded_row_size(node.rows[i]), 4)
+        out = btcell.encode_row(out, node.rows[i])
+    pad(out)
+    Ok(out)
 
-// Encode an inner node as a whole page — header, ids, separators,
-// zero padding.
+// Encode an inner node as a whole page: header, ids, separators, zero
+// padding.
+//
+// `BadCount` when there is not exactly one more child than separator,
+// and `Overflow` when the node does not fit `payload_size()`.
 pub fn encode_inner(page_id: Int, node: Inner) -> Result<[Int], NodeError>
-    todo("btree-nv.nodefmt.encode_inner")
+    let k = list.len(node.children)
+    if k != list.len(node.separators) + 1
+        return Err(BadCount(count: list.len(node.separators), max: k - 1))
+    let need = inner_encoded_size(node)
+    if need > payload_size()
+        return Err(Overflow(need: need, have: payload_size()))
+    var out = encode_header(KIND_INNER, page_id)
+    put_be(out, k, 4)
+    for c in node.children
+        put_be(out, c, 4)
+    for s in node.separators
+        put_be(out, s, 8)
+    pad(out)
+    Ok(out)
+
+// Refuse a page of the wrong length or kind.
+fn check(page: [Int], want: Int) -> Result<Unit, NodeError>
+    let n = list.len(page)
+    if n < header_size() or n > page_size()
+        return Err(BadPageSize(got: n, want: page_size()))
+    if page[0] != want
+        return Err(WrongKind(got: page[0], want: want))
+    Ok(())
+
+// The page as exactly `page_size()` bytes: what the page has, then
+// zeros.
+fn whole(page: [Int]) -> [Int]
+    var out = list.clone(page)
+    pad(out)
+    out
 
 // Decode a whole leaf page, header included.
 pub fn decode_leaf(page: [Int]) -> Result<Leaf, NodeError>
-    todo("btree-nv.nodefmt.decode_leaf")
+    check(page, KIND_LEAF)!
+    let buf = whole(page)
+    let h = header_size()
+    let m = get_be(buf, h, 4)
+    let max = (payload_size() - 4) / 16
+    if m > max
+        return Err(BadCount(count: m, max: max))
+    var keys: [Int] = []
+    var rows: [[btcell.Cell]] = []
+    var at = h + 4
+    for i in 0..m
+        if at + 12 > page_size()
+            return Err(BadRow(index: i, cause: Truncated(offset: at, want: 12, have: page_size() - at)))
+        list.push(keys, get_be(buf, at, 8))
+        let len = get_be(buf, at + 8, 4)
+        let start = at + 12
+        if len > page_size() - start
+            return Err(BadRow(index: i, cause: Truncated(offset: start, want: len, have: page_size() - start)))
+        let body = list.slice(buf, start, start + len)
+        match btcell.decode_row(body, 0)
+            Ok(r)  => list.push(rows, r.row[:])
+            Err(e) => return Err(BadRow(index: i, cause: e))
+        at = start + len
+    Ok(Leaf { keys: keys, rows: rows })
 
 // Decode a whole inner page, header included.
+//
+// `BadCount` when the child count is zero or names more children than
+// the payload holds.
 pub fn decode_inner(page: [Int]) -> Result<Inner, NodeError>
-    todo("btree-nv.nodefmt.decode_inner")
+    check(page, KIND_INNER)!
+    let h = header_size()
+    let k = get_be(page, h, 4)
+    let max = (payload_size() + 4) / 12
+    if k == 0 or k > max
+        return Err(BadCount(count: k, max: max))
+    var children: [Int] = []
+    var separators: [Int] = []
+    for i in 0..k
+        list.push(children, get_be(page, h + 4 + 4 * i, 4))
+    let base = h + 4 + 4 * k
+    for i in 0..k - 1
+        list.push(separators, get_be(page, base + 8 * i, 8))
+    Ok(Inner { separators: separators, children: children })
 
-// How many payload bytes `encode_leaf` will spend on this node.
-//
-// The insert path calls this before it commits to a leaf, which is how
-// it decides to split without encoding twice.
+// How many payload bytes `encode_leaf` spends on this node.
 pub fn leaf_encoded_size(node: Leaf) -> Int
-    todo("btree-nv.nodefmt.leaf_encoded_size")
+    var n = 4
+    for r in node.rows
+        n = n + 12 + btcell.encoded_row_size(r)
+    n
 
-// How many payload bytes `encode_inner` will spend on this node.
+// How many payload bytes `encode_inner` spends on this node.
 pub fn inner_encoded_size(node: Inner) -> Int
-    todo("btree-nv.nodefmt.inner_encoded_size")
+    4 + 4 * list.len(node.children) + 8 * list.len(node.separators)
 
-// The index in `keys` where `key` is, or where it would be inserted.
-//
-// A binary search, exposed because the same answer is what an inner
-// node's descent needs and what a leaf's lookup needs, and a caller
-// walking a decoded node should not write it a third time.
+// The index in `keys` where `key` is, or where it would be inserted:
+// the count of keys below it, found by binary search over ascending
+// `keys`.
 pub fn seek(keys: [Int], key: Int) -> Int
-    todo("btree-nv.nodefmt.seek")
+    var lo = 0
+    var hi = list.len(keys)
+    loop
+        if lo >= hi
+            return lo
+        let mid = (lo + hi) / 2
+        if keys[mid] < key
+            lo = mid + 1
+        else
+            hi = mid
 
 // Which child of an inner node a key descends into: the count of
 // separators less than or equal to it.
 pub fn child_for(node: Inner, key: Int) -> Int
-    todo("btree-nv.nodefmt.child_for")
+    let i = seek(node.separators, key)
+    if i < list.len(node.separators) and node.separators[i] == key
+        return i + 1
+    i
 
 // Why a page is not the node it claimed to be.
 pub enum NodeError
-    // The page is not `page_size()` bytes long.
+    // The page is shorter than a header or longer than `page_size()`.
     BadPageSize(got: Int, want: Int)
     // Byte 0 is not the kind the caller asked to decode.
     WrongKind(got: Int, want: Int)
-    // A count field names more entries than the payload can hold.
+    // A count field is zero where a node needs one, or names more
+    // entries than the payload holds, or an inner node's children and
+    // separators do not differ by one.
     BadCount(count: Int, max: Int)
-    // The node's rows do not fit one page.  The encoder reports this
-    // rather than splitting, because the split is the tree's decision.
+    // The node does not fit one page.
     Overflow(need: Int, have: Int)
-    // A row inside the payload did not decode.
+    // Entry `index` did not decode.
     BadRow(index: Int, cause: btcell.CellError)
-    // The header's page id is not the id the page was fetched under —
-    // the cheapest detector for a mis-seeked read.
+    // The header's page id is not the id the page was fetched under.
     IdMismatch(got: Int, want: Int)
 
-// The human sentence behind each way a page can fail to be a node.
+// The one-line report of a node refusal.
 impl Error for NodeError
     fn message(self) -> Str
-        todo("btree-nv.nodefmt.NodeError.message")
+        match self
+            BadPageSize(g, w) => "nodefmt: a page of ${g} bytes, not ${w}"
+            WrongKind(g, w)   => "nodefmt: page kind ${g}, not ${w}"
+            BadCount(c, m)    => "nodefmt: a count of ${c} where at most ${m} fit"
+            Overflow(n, h)    => "nodefmt: the node needs ${n} bytes and a page holds ${h}"
+            BadRow(i, e)      => "nodefmt: entry ${i}: ${e.message()}"
+            IdMismatch(g, w)  => "nodefmt: the page says it is ${g}, and ${w} was asked for"

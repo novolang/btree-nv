@@ -1,34 +1,18 @@
 // btcell.nv — the value a row holds, and the bytes it becomes.
 //
-// A row is a `[Cell]`, and a cell is one of five things SQLite's
-// storage classes name: an integer, a float, text, a blob, or NULL.
-// Nothing else appears in a page, so nothing else appears here.
+// A row is a `[Cell]`, and a cell is one of the five storage classes
+// SQLite names: an integer, a float, text, a blob, or NULL (SQLite's
+// "Datatypes In SQLite", section 2).  Nothing else appears in a page.
 //
-// WHY THIS TYPE LIVES IN btree-nv AND NOT IN sql-engine-nv
-//
-// novodb carries two of it.  `parse.Value` is what a literal in the
-// SQL text becomes (`VInt`, `VFloat`, `VStr`, `VNull`, `VBlob`) and
-// `btree.Cell` is what a row in the tree holds (`CInt`, `CFloat`,
-// `CStr`, `CNull`, `CBlob`) — the same five classes, twice, with
-// `parse.value_to_cell` copying between them at every INSERT.  The
-// duplication is free inside one package and is not free across two:
-// it would put the bridge function on the package boundary, where a
-// consumer would have to know both spellings and which side of the
-// call it was on.  So there is one type, it is the STORAGE one, and
-// sql-engine-nv's literals produce it directly.
-//
-// The encoding below is `page_btree.nv`'s, unchanged: a one-byte tag
-// then the payload, big-endian throughout.  The float case is the one
-// that is not settled — novodb encodes a float as the TEXT of
-// `string_of_float` because the stdlib had no `float.to_bits` when it
-// was written, which is neither compact nor round-trip exact.  This
-// package declares the bit form and the README says so.
+// A cell is written as a one-byte tag and then its payload, big-endian
+// throughout.  A float is its IEEE 754 binary64 bits, so a float read
+// back is the float written, bit for bit.  The type lives in this
+// package, not in a SQL package, because it is what a page stores: a
+// SQL engine built on the tree produces it directly.
 
 // A stored value: one of the five classes a page can hold.
 //
-// Byte tags, as they appear in an encoded row — the numbers are the
-// format, not an implementation detail, so they are written here
-// rather than derived:
+// The byte tags are the format:
 //
 // | tag | variant  | payload |
 // | --- | --- | --- |
@@ -52,76 +36,115 @@ pub enum Cell
 // let c = btcell.of_int(42)
 // ```
 pub fn of_int(n: Int) -> Cell
-    todo("btree-nv.btcell.of_int")
+    CInt(n: n)
 
 // A cell holding a float.
 pub fn of_float(f: Float) -> Cell
-    todo("btree-nv.btcell.of_float")
+    CFloat(f: f)
 
 // A cell holding text.
 pub fn of_str(s: Str) -> Cell
-    todo("btree-nv.btcell.of_str")
+    CStr(s: s)
 
 // A cell holding a blob, one byte (0..=255) per element.
 pub fn of_blob(bytes: [Int]) -> Cell
-    todo("btree-nv.btcell.of_blob")
+    CBlob(bytes: list.clone(bytes))
 
 // The NULL cell.
 pub fn null_cell() -> Cell
-    todo("btree-nv.btcell.null_cell")
+    CNull
 
 // The integer a cell holds, or `None` when it holds something else.
 //
-// The accessors exist so a consumer never matches `Cell` itself.
-// That is novodb's own rule — `btree.nv` owns the representation and
-// `parse` and `exec` reach it only through these — and it is what
-// makes adding a sixth storage class one arm here rather than an arm
-// in every `match` in the closure.
+// A caller reads a cell through these accessors rather than by
+// matching `Cell`, so a sixth storage class would be one new arm here
+// rather than one in every caller.
 pub fn as_int(c: Cell) -> ?Int
-    todo("btree-nv.btcell.as_int")
+    match c
+        CInt(n) => Some(n)
+        _       => None
 
 // The float a cell holds, or `None` when it holds something else.
 pub fn as_float(c: Cell) -> ?Float
-    todo("btree-nv.btcell.as_float")
+    match c
+        CFloat(f) => Some(f)
+        _         => None
 
 // The text a cell holds, or `None` when it holds something else.
 pub fn as_str(c: Cell) -> ?Str
-    todo("btree-nv.btcell.as_str")
+    match c
+        CStr(s) => Some(s)
+        _       => None
 
 // The blob bytes a cell holds, or `None` when it holds something else.
 pub fn as_blob(c: Cell) -> ?[Int]
-    todo("btree-nv.btcell.as_blob")
+    match c
+        CBlob(b) => Some(list.clone(b))
+        _        => None
 
 // True when the cell is NULL.
 pub fn is_null(c: Cell) -> Bool
-    todo("btree-nv.btcell.is_null")
+    tag(c) == 0
 
-// The cell's byte tag — the number in the table on `Cell`.
+// The cell's byte tag, the number in the table on `Cell`.
 //
-// This is also the storage-class order SQL comparison uses when it has
-// to order values of different classes, which is why it is public
-// rather than private to the encoder.
+// It is also the order SQL comparison gives values of different
+// storage classes, which is why it is public.
 pub fn tag(c: Cell) -> Int
-    todo("btree-nv.btcell.tag")
+    match c
+        CNull     => 0
+        CInt(_)   => 1
+        CFloat(_) => 2
+        CStr(_)   => 3
+        CBlob(_)  => 4
 
-// How many bytes `encode_cell` will write for this cell.
-//
-// Computed without encoding, because the leaf encoder has to decide
-// whether a row still fits the page before it commits to writing it.
+// How many bytes `encode_cell` writes for this cell, computed without
+// encoding it.
 pub fn encoded_size(c: Cell) -> Int
-    todo("btree-nv.btcell.encoded_size")
+    match c
+        CNull     => 1
+        CInt(_)   => 9
+        CFloat(_) => 9
+        CStr(s)   => 5 + str.len(s)
+        CBlob(b)  => 5 + list.len(b)
 
-// How many bytes `encode_row` will write for this row.
+// How many bytes `encode_row` writes for this row.
 pub fn encoded_row_size(row: [Cell]) -> Int
-    todo("btree-nv.btcell.encoded_row_size")
+    var n = 4
+    for c in row
+        n = n + encoded_size(c)
+    n
 
-// Append one cell's bytes to `out`, returning the extended list.
+// Append `n` bytes of `v`, big-endian.
+fn put_be(var out: [Int], v: Int, n: Int)
+    for i in 0..n
+        list.push(out, (v >>> (8 * (n - 1 - i))) & 0xff)
+
+// A new list: `out`'s bytes, then this cell's.
 pub fn encode_cell(out: [Int], c: Cell) -> [Int]
-    todo("btree-nv.btcell.encode_cell")
+    var b = list.clone(out)
+    list.push(b, tag(c))
+    match c
+        CNull     => ()
+        CInt(n)   => put_be(b, n, 8)
+        CFloat(f) => put_be(b, float.to_bits(f), 8)
+        CStr(s)   =>
+            put_be(b, str.len(s), 4)
+            for i in 0..str.len(s)
+                list.push(b, str.byte_at_or(s, i, 0))
+        CBlob(xs) =>
+            put_be(b, list.len(xs), 4)
+            list.append(b, list.clone(xs))
+    b
 
-// Append a whole row: a 4-byte big-endian cell count, then each cell.
+// A new list: `out`'s bytes, then a 4-byte big-endian cell count, then
+// each cell.
 pub fn encode_row(out: [Int], row: [Cell]) -> [Int]
-    todo("btree-nv.btcell.encode_row")
+    var b = list.clone(out)
+    put_be(b, list.len(row), 4)
+    for c in row
+        b = encode_cell(b, c)
+    b
 
 // One decoded cell and the offset just past it.
 pub struct CellAt
@@ -133,47 +156,166 @@ pub struct RowAt
     row: [Cell]
     next_offset: Int
 
+// Read `n` big-endian bytes at `offset`.  The caller has checked that
+// they are there.
+fn get_be(buf: [Int], offset: Int, n: Int) -> Int
+    var v = 0
+    for i in 0..n
+        v = (v << 8) | (buf[offset + i] & 0xff)
+    v
+
+// Refuse `want` bytes at `offset` that the buffer does not hold.
+fn need(buf: [Int], offset: Int, want: Int) -> Result<Unit, CellError>
+    let have = list.len(buf) - offset
+    if have < want
+        return Err(Truncated(offset: offset, want: want, have: if have < 0 then 0 else have))
+    Ok(())
+
 // Decode the cell that starts at `offset`, or say how the bytes were
 // wrong.
 pub fn decode_cell(buf: [Int], offset: Int) -> Result<CellAt, CellError>
-    todo("btree-nv.btcell.decode_cell")
+    need(buf, offset, 1)!
+    let t = buf[offset]
+    let at = offset + 1
+    match t
+        0 => Ok(CellAt { value: CNull, next_offset: at })
+        1 =>
+            need(buf, at, 8)!
+            Ok(CellAt { value: CInt(n: get_be(buf, at, 8)), next_offset: at + 8 })
+        2 =>
+            need(buf, at, 8)!
+            Ok(CellAt { value: CFloat(f: float.from_bits(get_be(buf, at, 8))), next_offset: at + 8 })
+        3 => decode_text(buf, at)
+        4 => decode_blob(buf, at)
+        _ => Err(BadTag(offset: offset, tag: t))
+
+fn decode_text(buf: [Int], at: Int) -> Result<CellAt, CellError>
+    need(buf, at, 4)!
+    let n = get_be(buf, at, 4)
+    let start = at + 4
+    need(buf, start, n)!
+    let bad = first_bad_utf8(buf, start, start + n)
+    if bad >= 0
+        return Err(BadUtf8(offset: bad))
+    var sb = str.builder_new_cap(n)
+    for i in start..start + n
+        str.builder_append_char(sb, buf[i])
+    let s = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    Ok(CellAt { value: CStr(s: s), next_offset: start + n })
+
+fn decode_blob(buf: [Int], at: Int) -> Result<CellAt, CellError>
+    need(buf, at, 4)!
+    let n = get_be(buf, at, 4)
+    let start = at + 4
+    need(buf, start, n)!
+    for i in start..start + n
+        if buf[i] < 0 or buf[i] > 255
+            return Err(ByteOutOfRange(offset: i, value: buf[i]))
+    Ok(CellAt { value: CBlob(bytes: list.slice(buf, start, start + n)), next_offset: start + n })
+
+// The offset of the first byte in `[from, to)` that breaks UTF-8, or
+// -1.  The rule is RFC 3629 section 4.
+fn first_bad_utf8(buf: [Int], from: Int, to: Int) -> Int
+    var i = from
+    loop
+        if i >= to
+            return 0 - 1
+        let n = utf8_len(buf, i, to)
+        if n == 0
+            return i
+        i = i + n
+
+// The length of the well-formed sequence at `i`, or 0.
+fn utf8_len(buf: [Int], i: Int, to: Int) -> Int
+    let c0 = buf[i]
+    if c0 >= 0 and c0 < 128
+        return 1
+    var need = 0
+    var lo = 128
+    var hi = 191
+    if c0 >= 194 and c0 <= 223
+        need = 1
+    else if c0 >= 224 and c0 <= 239
+        need = 2
+        lo = if c0 == 224 then 160 else 128
+        hi = if c0 == 237 then 159 else 191
+    else if c0 >= 240 and c0 <= 244
+        need = 3
+        lo = if c0 == 240 then 144 else 128
+        hi = if c0 == 244 then 143 else 191
+    else
+        return 0
+    if i + need >= to + 1
+        return 0
+    if buf[i + 1] < lo or buf[i + 1] > hi
+        return 0
+    for k in 2..need + 1
+        if buf[i + k] < 128 or buf[i + k] > 191
+            return 0
+    need + 1
 
 // Decode the row that starts at `offset`, or say how the bytes were
 // wrong.
 pub fn decode_row(buf: [Int], offset: Int) -> Result<RowAt, CellError>
-    todo("btree-nv.btcell.decode_row")
+    need(buf, offset, 4)!
+    let n = get_be(buf, offset, 4)
+    var row: [Cell] = []
+    var at = offset + 4
+    for k in 0..n
+        let c = decode_cell(buf, at)!
+        list.push(row, c.value)
+        at = c.next_offset
+    Ok(RowAt { row: row, next_offset: at })
 
 // Why a run of bytes is not a cell or a row.
 //
-// Every arm names the offset it failed at, because a caller holding a
-// 4096-byte page and a "bad tag" has been told nothing.
+// Every arm names the offset it failed at.
 pub enum CellError
     // The tag byte at this offset is not one of 0..=4.
     BadTag(offset: Int, tag: Int)
-    // A length prefix ran past the end of the buffer.
+    // A length or a payload ran past the end of the buffer: `want`
+    // bytes were needed at `offset` and `have` were there.
     Truncated(offset: Int, want: Int, have: Int)
-    // A text payload is not valid UTF-8.
+    // A text payload is not valid UTF-8 at this offset.
     BadUtf8(offset: Int)
-    // A blob byte is outside 0..=255, which the encoder cannot have
-    // written — the page has been corrupted since it was stored.
+    // A blob byte outside 0..=255, which the encoder cannot have
+    // written.
     ByteOutOfRange(offset: Int, value: Int)
 
-// The human sentence behind each way a cell can fail to decode.
-//
-// `Result<T, E>` carries an `Error` bound (SPEC § 3.4), so this impl
-// is what lets the decoders return the enum rather than a string.
+// The one-line report of a cell refusal.
 impl Error for CellError
     fn message(self) -> Str
-        todo("btree-nv.btcell.CellError.message")
+        match self
+            BadTag(o, t)          => "btcell: tag ${t} at byte ${o} is not a storage class"
+            Truncated(o, w, h)    => "btcell: ${w} byte(s) needed at byte ${o}, ${h} left"
+            BadUtf8(o)            => "btcell: text is not UTF-8 at byte ${o}"
+            ByteOutOfRange(o, v)  => "btcell: blob byte ${v} at ${o} is outside 0 to 255"
 
-// The cell as SQL text: an integer bare, text single-quoted, a blob as
-// `X'aabb'`, and NULL as `NULL`.
-//
-// The rendering is the one novodb's `show_cell` produces, which the
-// SQL-logic-test corpus compares against.
+// The cell as SQL text: an integer bare, a float as novo-lang prints
+// it, text single-quoted with each quote doubled, a blob as `X'aabb'`,
+// and NULL as `NULL`.
 pub fn show(c: Cell) -> Str
-    todo("btree-nv.btcell.show")
+    match c
+        CNull     => "NULL"
+        CInt(n)   => str.from_int(n)
+        CFloat(f) => str.from_float(f)
+        CStr(s)   => "'" + str.replace(s, "'", "''") + "'"
+        CBlob(xs) => "X'" + hex(xs) + "'"
+
+fn hex(xs: [Int]) -> Str
+    let digits = "0123456789abcdef"
+    var sb = str.builder_new()
+    for x in xs
+        str.builder_append_char(sb, str.byte_at_or(digits, (x >>> 4) & 15, 0))
+        str.builder_append_char(sb, str.byte_at_or(digits, x & 15, 0))
+    let out = str.builder_to_str(sb)
+    str.builder_drop(sb)
+    out
 
 // A row as SQL text: `show` of each cell, separated by `, `.
 pub fn show_row(row: [Cell]) -> Str
-    todo("btree-nv.btcell.show_row")
+    var parts: [Str] = []
+    for c in row
+        list.push(parts, show(c))
+    str.join(parts, ", ")
