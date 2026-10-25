@@ -504,7 +504,7 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
         split_leaf(keys, rows)
     for j in 0..list.len(leaves)
         if j > 0
-            list.push(ids, alloc(plan, nodefmt.KIND_LEAF))
+            list.push(ids, alloc(var plan, nodefmt.KIND_LEAF))
             list.push(firsts, leaves[j].keys[0])
         list.push(plan.writes, BtWrite { page_id: ids[j], node: BtLeaf(leaf: leaves[j]) })
     var root = c.tree.root
@@ -513,7 +513,7 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
         if list.len(ids) == 1
             break
         if level == 0
-            let top = alloc(plan, nodefmt.KIND_INNER)
+            let top = alloc(var plan, nodefmt.KIND_INNER)
             list.push(plan.writes, BtWrite { page_id: top,
                 node: BtInner(inner: Inner { separators: firsts, children: ids }) })
             root = top
@@ -529,7 +529,7 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
         let split = split_inner(seps, kids)
         ids = [c.path[level]]
         for j in 1..list.len(split.pieces)
-            list.push(ids, alloc(plan, nodefmt.KIND_INNER))
+            list.push(ids, alloc(var plan, nodefmt.KIND_INNER))
         for j in 0..list.len(split.pieces)
             list.push(plan.writes, BtWrite { page_id: ids[j], node: BtInner(inner: split.pieces[j]) })
         firsts = split.promoted[:]
@@ -538,7 +538,7 @@ fn plan_insert(c: Cursor, leaf: nodefmt.Leaf) -> Progress
     else
         1
     let next = Tree { root: root, size: c.tree.size + grown, height: height }
-    start_plan(c, plan, next, 1)
+    start_plan(c, var plan, next, 1)
 
 // The inner node at `level` on the path.  Every level above the leaf
 // holds one.
@@ -587,7 +587,7 @@ fn plan_delete(c: Cursor, leaf: nodefmt.Leaf) -> Progress
                     node: BtInner(inner: Inner { separators: seps, children: kids }) })
                 break
     let next = Tree { root: root, size: c.tree.size - 1, height: height }
-    start_plan(c, plan, next, 1)
+    start_plan(c, var plan, next, 1)
 
 // Hand the plan to the cursor and send its first request.
 fn start_plan(c: Cursor, var plan: PbPlan, next: Tree, affected: Int) -> Progress

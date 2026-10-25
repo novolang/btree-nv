@@ -107,7 +107,7 @@ fn collect(s: Store, id: Int, lo: Int, hi: Int, depth: Int, var keys: [Int], var
                         n.separators[i]
                     if a > b
                         return "inner ${id}: separators out of order"
-                    let why = collect(s, n.children[i], a, b, depth + 1, keys, vals, leaf_depths)
+                    let why = collect(s, n.children[i], a, b, depth + 1, var keys, var vals, var leaf_depths)
                     if why != ""
                         return why
                 return ""
@@ -134,8 +134,8 @@ fn check(s: Store, t: btree.Tree, model_keys: [Int], model_vals: [Int]) -> Str
     var keys: [Int] = []
     var vals: [Int] = []
     var depths: [Int] = []
-    let why = collect(s, t.root, 0 - 9223372036854775807 - 1, 9223372036854775807, 1, keys,
-        vals, depths)
+    let why = collect(s, t.root, 0 - 9223372036854775807 - 1, 9223372036854775807, 1, var keys,
+        var vals, var depths)
     if why != ""
         return why
     for d in depths
@@ -171,7 +171,7 @@ fn run_model(seed0: Int, ops: Int, span: Int, big_every: Int, grow: Int) -> Seen
     var max_height = 1
     var frees = 0
     var shrinks = 0
-    var t = empty_tree(s)
+    var t = empty_tree(var s)
     var mk: [Int] = []
     var mv: [Int] = []
     var seed = seed0
@@ -187,7 +187,7 @@ fn run_model(seed0: Int, ops: Int, span: Int, big_every: Int, grow: Int) -> Seen
         let i = nodefmt.seek(mk, key)
         let there = i < list.len(mk) and mk[i] == key
         if deleting
-            let d = drive(s, btree.delete(t, key))
+            let d = drive(var s, btree.delete(t, key))
             if d.affected != (if there then 1 else 0)
                 return seen("step ${step}: delete ${key} affected ${d.affected}")
             frees = frees + d.frees
@@ -198,7 +198,7 @@ fn run_model(seed0: Int, ops: Int, span: Int, big_every: Int, grow: Int) -> Seen
                 mv = list.concat(list.slice(mv, 0, i), list.slice(mv, i + 1, list.len(mv)))
             t = d.tree
         else
-            let d = drive(s, btree.insert(t, key, row_of(step, pad)))
+            let d = drive(var s, btree.insert(t, key, row_of(step, pad)))
             if d.affected != 1
                 return seen("step ${step}: insert ${key} affected ${d.affected}")
             if there
@@ -213,7 +213,7 @@ fn run_model(seed0: Int, ops: Int, span: Int, big_every: Int, grow: Int) -> Seen
         if why != ""
             return seen("step ${step}: ${why}")
     // A scan reads back what the model holds.
-    let all = drive(s, btree.scan(t))
+    let all = drive(var s, btree.scan(t))
     if all.keys != mk
         return seen("the scan answered ${all.keys}")
     if all.tree.size != list.len(mk)
@@ -275,22 +275,22 @@ fn test_a_lookup_asks_for_the_root_before_anything_else()
 @test
 fn test_a_lookup_answers_the_row_then_one_and_a_miss_answers_zero()
     var s = new_store()
-    let t0 = empty_tree(s)
-    let t = drive(s, btree.insert(t0, 5, row_of(50, 0))).tree
-    let hit = drive(s, btree.lookup(t, 5))
+    let t0 = empty_tree(var s)
+    let t = drive(var s, btree.insert(t0, 5, row_of(50, 0))).tree
+    let hit = drive(var s, btree.lookup(t, 5))
     test.assert_eq(hit.affected, 1)
     test.assert_eq(btcell.as_int(hit.rows[0][0]) ?? 0, 50)
-    test.assert_eq(drive(s, btree.lookup(t, 6)).affected, 0)
-    let r = drive(s, btree.range(t, 0, 4))
+    test.assert_eq(drive(var s, btree.lookup(t, 6)).affected, 0)
+    let r = drive(var s, btree.range(t, 0, 4))
     test.assert_eq(r.affected, 0)
 
 @test
 fn test_a_range_past_the_last_key_ends_with_the_tree()
     var s = new_store()
-    var t = empty_tree(s)
+    var t = empty_tree(var s)
     for k in 0..30
-        t = drive(s, btree.insert(t, k, row_of(k, 0))).tree
-    let r = drive(s, btree.range(t, 25, 1000))
+        t = drive(var s, btree.insert(t, k, row_of(k, 0))).tree
+    let r = drive(var s, btree.range(t, 25, 1000))
     test.assert_eq(r.keys, [25, 26, 27, 28, 29])
     // A range does not learn the tree's size; a scan does.
     test.assert_eq(r.tree.size, 30)
@@ -304,7 +304,7 @@ fn test_an_inner_node_left_with_no_child_is_freed_too()
         leaf_page(4, [1])]
     for p in pages
         list.push(s.pages, p[:])
-    let d = drive(s, btree.delete(btree.open(1, 2, 3), 1))
+    let d = drive(var s, btree.delete(btree.open(1, 2, 3), 1))
     test.assert_eq(d.affected, 1)
     test.assert_eq(s.freed, [4, 2, 1])
     test.assert_eq(d.tree.root, 3)
@@ -327,10 +327,10 @@ fn leaf_page(id: Int, keys: [Int]) -> [Int]
 @test
 fn test_a_range_stops_at_its_upper_bound()
     var s = new_store()
-    var t = empty_tree(s)
+    var t = empty_tree(var s)
     for k in 0..40
-        t = drive(s, btree.insert(t, k * 2, row_of(k, 0))).tree
-    let r = drive(s, btree.range(t, 11, 20))
+        t = drive(var s, btree.insert(t, k * 2, row_of(k, 0))).tree
+    let r = drive(var s, btree.range(t, 11, 20))
     test.assert_eq(r.keys, [12, 14, 16, 18, 20])
     test.assert_eq(r.affected, 5)
     let c = btree.range(t, 10, 20)
@@ -340,7 +340,7 @@ fn test_a_range_stops_at_its_upper_bound()
 @test
 fn test_a_finished_cursor_stays_finished()
     var s = new_store()
-    let t = empty_tree(s)
+    let t = empty_tree(var s)
     var c = btree.scan(t)
     var p = btree.step(c)
     c = btree.feed_page(p.cursor, 1, s.pages[1])
@@ -391,14 +391,14 @@ fn test_a_page_that_is_not_the_node_asked_for_fails_the_walk()
     var s = new_store()
     list.push(s.pages, [])
     list.push(s.pages, loop_page[:])
-    let d = drive(s, btree.scan(t))
+    let d = drive(var s, btree.scan(t))
     test.assert_eq(d.failed == Some(Cycle(page_id: 2, depth: 2)), true)
 
 @test
 fn test_a_row_too_large_for_a_page_fails_the_insert()
     var s = new_store()
-    let t = empty_tree(s)
-    let d = drive(s, btree.insert(t, 1, row_of(1, 5000)))
+    let t = empty_tree(var s)
+    let d = drive(var s, btree.insert(t, 1, row_of(1, 5000)))
     match d.failed
         Some(RowTooLarge(k, need, have)) =>
             test.assert_eq(k, 1)
@@ -409,19 +409,19 @@ fn test_a_row_too_large_for_a_page_fails_the_insert()
 @test
 fn test_a_delete_that_changes_nothing_writes_nothing()
     var s = new_store()
-    let t = empty_tree(s)
-    let d = drive(s, btree.delete(t, 404))
+    let t = empty_tree(var s)
+    let d = drive(var s, btree.delete(t, 404))
     test.assert_eq(d.affected, 0)
     test.assert_eq(d.writes + d.allocs + d.frees, 0)
 
 @test
 fn test_a_split_of_the_root_moves_it_and_keeps_eight_on_the_left()
     var s = new_store()
-    var t = empty_tree(s)
+    var t = empty_tree(var s)
     for k in 0..16
-        t = drive(s, btree.insert(t, k, row_of(k, 0))).tree
+        t = drive(var s, btree.insert(t, k, row_of(k, 0))).tree
     test.assert_eq(t.root, 1)
-    let d = drive(s, btree.insert(t, 16, row_of(16, 0)))
+    let d = drive(var s, btree.insert(t, 16, row_of(16, 0)))
     test.assert_eq(d.allocs, 2)
     test.assert_eq(d.writes, 3)
     test.assert_eq(d.tree.root, 3)

@@ -103,7 +103,7 @@ fn get_be(page: [Int], i: Int, n: Int) -> Int
 // Answers exactly `header_size()` bytes; the payload follows.
 pub fn encode_header(kind: Int, page_id: Int) -> [Int]
     var out: [Int] = [kind & 0xff, 0, 0, 0]
-    put_be(out, page_id, 4)
+    put_be(var out, page_id, 4)
     for i in 0..8
         list.push(out, 0)
     out
@@ -139,12 +139,12 @@ pub fn encode_leaf(page_id: Int, node: Leaf) -> Result<[Int], NodeError>
     if need > payload_size()
         return Err(Overflow(need: need, have: payload_size()))
     var out = encode_header(KIND_LEAF, page_id)
-    put_be(out, list.len(node.keys), 4)
+    put_be(var out, list.len(node.keys), 4)
     for i in 0..list.len(node.keys)
-        put_be(out, node.keys[i], 8)
-        put_be(out, btcell.encoded_row_size(node.rows[i]), 4)
+        put_be(var out, node.keys[i], 8)
+        put_be(var out, btcell.encoded_row_size(node.rows[i]), 4)
         out = btcell.encode_row(out, node.rows[i])
-    pad(out)
+    pad(var out)
     Ok(out)
 
 // Encode an inner node as a whole page: header, ids, separators, zero
@@ -160,12 +160,12 @@ pub fn encode_inner(page_id: Int, node: Inner) -> Result<[Int], NodeError>
     if need > payload_size()
         return Err(Overflow(need: need, have: payload_size()))
     var out = encode_header(KIND_INNER, page_id)
-    put_be(out, k, 4)
+    put_be(var out, k, 4)
     for c in node.children
-        put_be(out, c, 4)
+        put_be(var out, c, 4)
     for s in node.separators
-        put_be(out, s, 8)
-    pad(out)
+        put_be(var out, s, 8)
+    pad(var out)
     Ok(out)
 
 // Refuse a page of the wrong length or kind.
@@ -181,7 +181,7 @@ fn check(page: [Int], want: Int) -> Result<Unit, NodeError>
 // zeros.
 fn whole(page: [Int]) -> [Int]
     var out = list.clone(page)
-    pad(out)
+    pad(var out)
     out
 
 // Decode a whole leaf page, header included.

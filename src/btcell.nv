@@ -126,14 +126,14 @@ pub fn encode_cell(out: [Int], c: Cell) -> [Int]
     list.push(b, tag(c))
     match c
         CNull     => ()
-        CInt(n)   => put_be(b, n, 8)
-        CFloat(f) => put_be(b, float.to_bits(f), 8)
+        CInt(n)   => put_be(var b, n, 8)
+        CFloat(f) => put_be(var b, float.to_bits(f), 8)
         CStr(s)   =>
-            put_be(b, str.len(s), 4)
+            put_be(var b, str.len(s), 4)
             for i in 0..str.len(s)
                 list.push(b, str.byte_at_or(s, i, 0))
         CBlob(xs) =>
-            put_be(b, list.len(xs), 4)
+            put_be(var b, list.len(xs), 4)
             list.append(b, list.clone(xs))
     b
 
@@ -141,7 +141,7 @@ pub fn encode_cell(out: [Int], c: Cell) -> [Int]
 // each cell.
 pub fn encode_row(out: [Int], row: [Cell]) -> [Int]
     var b = list.clone(out)
-    put_be(b, list.len(row), 4)
+    put_be(var b, list.len(row), 4)
     for c in row
         b = encode_cell(b, c)
     b
